@@ -19,3 +19,15 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+---
+
+Third-party assets
+------------------
+
+The NetBird system-tray icons under `assets/` are not covered by the above.
+They are © 2022 NetBird GmbH & AUTHORS and licensed BSD-3-Clause, taken
+unmodified from github.com/netbirdio/netbird at commit
+11733fd718fb7889cfbf8b4e6498c0b4e74a1eb0, path `client/ui/assets/`.
+
+See `assets/NOTICE` for the file list, checksums, and the full licence text.

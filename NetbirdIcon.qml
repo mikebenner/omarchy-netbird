@@ -1,87 +1,53 @@
+import Quickshell
 import QtQuick
 import qs.Commons
-import qs.Ui
 
+// The official NetBird system-tray icons, one per connection state — the same
+// artwork netbird-ui puts in the tray, replacing a hand-drawn Canvas mark. The
+// icons carry the state themselves, so there is no `crossed` or `warning`
+// overlay to compose: pick a state and the artwork says the rest.
+//
+// Colour only, deliberately. A themed monochrome variant was built and then
+// withdrawn: tinting the upstream white silhouette draws nothing inside
+// quickshell's layer-shell bar, with no error logged, while the identical code
+// tints correctly under plain `qml6`. See `assets/NOTICE` for the unused mono
+// files and .herd/results/t03.md for what was tried.
+//
+// `state` is Item's own string property rather than a redeclared one: QML will
+// not let a subclass shadow it, and with no `states:` defined the state machine
+// stays inert, so it behaves as the plain string the API asks for.
 Item {
   id: root
 
   property real iconSize: Style.font.icon
-  property color color: Color.foreground
-  property color badgeColor: Color.urgent
-  property bool crossed: false
-  property bool warning: false
+
+  state: "disconnected"
 
   width: iconSize
   height: iconSize
   implicitWidth: iconSize
   implicitHeight: iconSize
 
-  // The NetBird mark is two straight-edged wings that meet in a checkmark, so
-  // it survives being drawn as flat polygons at bar size where a traced SVG or
-  // a curved silhouette would turn to mush. Same reasoning as the Tailscale
-  // widget's dot grid: native shapes beat a tiny scaled image.
-  Canvas {
-    id: mark
+  // An absent CLI has no NetBird state to report, so it borrows the
+  // disconnected mark and fades it: the daemon is not merely off, it is not
+  // there. Opacity rather than a tint, so this needs no render effect.
+  readonly property bool notInstalled: root.state === "notInstalled"
+
+  readonly property string assetState: {
+    var value = String(root.state || "")
+    if (value === "connected" || value === "connecting" || value === "error") return value
+    if (value === "needsLogin") return "needs-login"
+    return "disconnected"
+  }
+
+  Image {
     anchors.fill: parent
-    antialiasing: true
-
-    readonly property color markColor: root.color
-
-    onMarkColorChanged: requestPaint()
-    onWidthChanged: requestPaint()
-    onHeightChanged: requestPaint()
-
-    onPaint: {
-      var ctx = getContext("2d")
-      ctx.reset()
-      var s = Math.min(width, height)
-      if (s <= 0) return
-      var ox = (width - s) / 2
-      var oy = (height - s) / 2
-      ctx.fillStyle = mark.markColor
-
-      function poly(points) {
-        ctx.beginPath()
-        ctx.moveTo(ox + points[0][0] * s, oy + points[0][1] * s)
-        for (var i = 1; i < points.length; i++) ctx.lineTo(ox + points[i][0] * s, oy + points[i][1] * s)
-        ctx.closePath()
-        ctx.fill()
-      }
-
-      // Left wing: a broad quad sheared down and to the right.
-      poly([[0.03, 0.17], [0.31, 0.17], [0.63, 0.85], [0.29, 0.85]])
-      // Right wing: a taller triangle falling back to the same landing point.
-      poly([[0.57, 0.17], [0.97, 0.17], [0.45, 0.85]])
-    }
-  }
-
-  Rectangle {
-    visible: root.crossed
-    anchors.centerIn: parent
-    width: parent.width * 1.22
-    height: Math.max(2, parent.height * 0.14)
-    radius: height / 2
-    color: root.color
-    rotation: -45
-  }
-
-  BorderSurface {
-    visible: root.warning
-    width: Math.max(7, parent.width * 0.42)
-    height: width
-    radius: width / 2
-    color: root.badgeColor
-    anchors.right: parent.right
-    anchors.bottom: parent.bottom
-    borderSpec: Border.flat(Color.popups.background, 1)
-
-    Text {
-      anchors.centerIn: parent
-      text: "!"
-      color: Color.background
-      font.family: Style.font.family
-      font.pixelSize: Math.max(6, parent.height * 0.72)
-      font.bold: true
-    }
+    source: "assets/netbird-systemtray-" + root.assetState + ".png"
+    sourceSize.width: Math.round(root.iconSize * Screen.devicePixelRatio)
+    sourceSize.height: Math.round(root.iconSize * Screen.devicePixelRatio)
+    fillMode: Image.PreserveAspectFit
+    smooth: true
+    mipmap: true
+    opacity: root.notInstalled ? 0.45 : 1.0
   }
 }

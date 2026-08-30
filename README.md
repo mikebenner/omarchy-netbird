@@ -153,10 +153,27 @@ operator authorization row.
 
 ## Icon
 
-`NetbirdIcon.qml` draws the NetBird mark natively as two flat wing polygons on
-a `Canvas`, the same reasoning as the Tailscale widget's dot grid: straight
-edges survive an 11px bar slot where a scaled image or a curved silhouette
-turns to mush.
+The bar shows NetBird's own system-tray artwork, one icon per connection
+state — the same coloured set `netbird-ui` puts in the tray. The icon carries
+the state on its own; there is no crossed-out or warning overlay drawn on top.
+
+| Widget state | Icon | When |
+|---|---|---|
+| connected | `connected` | daemon `Connected`, control plane healthy |
+| connecting | `connecting` | daemon `Connecting`, a toggle still in flight, or every peer still negotiating |
+| disconnected | `disconnected` | daemon `Idle`/`Disconnected` |
+| error | `error` | daemon `Connected` but management or signal is not |
+| needs login | `needs-login` | daemon `NeedsLogin`, `SessionExpired` or `LoginFailed` |
+| not installed | `disconnected`, faded | no `netbird` on `PATH` |
+
+Icons are © NetBird GmbH, BSD-3-Clause, taken unmodified from
+[netbirdio/netbird](https://github.com/netbirdio/netbird) — see
+[`assets/NOTICE`](assets/NOTICE) for the pinned commit, checksums, and licence.
+
+There is no theme-tinted monochrome style. One was built and withdrawn: the
+upstream white silhouettes tint correctly under plain `qml6` but draw nothing
+inside quickshell's layer-shell bar, with no error logged. The unused mono
+files still ship so a fix is a code-only change — `assets/NOTICE` lists them.
 
 ## Tests
 

@@ -33,9 +33,39 @@ Panel {
   // Only claim the header cursor when the switch is actually on screen —
   // "header" stays navigable, but an absent CLI leaves nothing to highlight.
   readonly property bool headerHasCursor: cursorActive && focusSection === "header" && netbird.installed
-  readonly property color iconColor: netbird.active ? foreground : dim
+
+  // A toggle the daemon has not caught up with yet. `active` is the optimistic
+  // value and `running` the observed one, so they disagree exactly while a
+  // requested up or down is still in flight.
+  readonly property bool togglePending: netbird.active !== netbird.running
+
+  // Every peer still negotiating and none up yet. Lazy connections make this a
+  // real, and temporary, state of the mesh rather than a fault.
+  readonly property bool peersConnectingOnly: {
+    if (!netbird.active || netbird.peersConnected > 0) return false
+    var list = netbird.peers || []
+    for (var i = 0; i < list.length; i++) if (list[i] && list[i].connecting === true) return true
+    return false
+  }
+
+  // Which of the official tray icons this moment calls for. Order matters:
+  // an absent CLI outranks everything, then re-authentication, then a control
+  // plane that is down under a daemon claiming to be up, and only then the
+  // ordinary on/off.
+  //
+  // Note `busy` is deliberately not consulted: it is true during every routine
+  // status poll, and wiring it here would blink the bar to "connecting" twice a
+  // minute. The daemon's own Connecting state, an in-flight toggle, and a mesh
+  // whose peers are all still negotiating are the three things that really mean
+  // it.
+  readonly property string iconState: {
+    if (!netbird.installed) return "notInstalled"
+    if (netbird.needsLogin) return "needsLogin"
+    if (netbird.active && netbird.degraded) return "error"
+    if (netbird.daemonStatus === "Connecting" || togglePending || peersConnectingOnly) return "connecting"
+    return netbird.active ? "connected" : "disconnected"
+  }
   readonly property string toggleHint: netbird.active ? "Turn NetBird off" : (netbird.needsLogin ? "Sign in to NetBird" : "Turn NetBird on")
-  readonly property color barIconColor: netbird.active ? barForeground : Qt.darker(barForeground, 1.55)
   readonly property string barTooltip: netbird.installed
     ? (netbird.statusText + (netbird.peerCountText !== "" ? " · " + netbird.peerCountText + " peers" : ""))
     : "NetBird is not installed"
@@ -226,10 +256,7 @@ Panel {
         NetbirdIcon {
           anchors.centerIn: parent
           iconSize: Style.space(11)
-          color: root.barIconColor
-          badgeColor: root.urgent
-          crossed: !netbird.active && !netbird.needsLogin
-          warning: netbird.needsLogin || netbird.degraded
+          state: root.iconState
         }
       }
     }
@@ -307,10 +334,7 @@ Panel {
               iconComponent: Component {
                 NetbirdIcon {
                   iconSize: Style.font.display
-                  color: root.iconColor
-                  badgeColor: root.urgent
-                  crossed: !netbird.active && !netbird.needsLogin
-                  warning: netbird.needsLogin || netbird.degraded
+                  state: root.iconState
                 }
               }
 

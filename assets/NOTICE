@@ -1,0 +1,73 @@
+NetBird tray icons
+==================
+
+The PNGs in this directory are the official NetBird system-tray icons, taken
+unmodified from the NetBird client:
+
+    https://github.com/netbirdio/netbird
+    commit 11733fd718fb7889cfbf8b4e6498c0b4e74a1eb0 (2026-08-28)
+    path   client/ui/assets/
+
+© 2022 NetBird GmbH & AUTHORS, licensed BSD-3-Clause. The upstream repository
+places management/, signal/, relay/ and combined/ under AGPLv3; client/ui/ is
+not among them, so these files are BSD-3-Clause.
+
+Files, and why these ones
+-------------------------
+
+    netbird-systemtray-<state>.png            the coloured mark (256x256)
+    netbird-systemtray-<state>-mono-dark.png  white silhouette (48x48)
+
+for <state> in connected, connecting, disconnected, error, needs-login.
+
+The upstream `-mono` variant is a black silhouette and `-mono-dark` is a white
+one over the same alpha shape. Tinting preserves the source's luminance, so a
+black source stays black whatever colour it is given; only the white
+`-mono-dark` variant can carry an arbitrary theme colour, which is why it is
+the one kept — despite the name it is not dark-theme-specific.
+
+NOTE: the `-mono-dark` files are currently UNUSED. The widget ships colour
+only. A themed monochrome style was built and withdrawn because the tint draws
+nothing inside quickshell's layer-shell bar (it renders correctly under plain
+`qml6`, and no error is logged either way). The files are kept, verified and
+pinned so reviving that style is a code-only change.
+
+At this commit netbird-systemtray-needs-login*.png is byte-identical to the
+corresponding netbird-systemtray-error*.png. Both names are shipped so the
+widget's state-to-file mapping stays a plain lookup.
+
+Verification
+------------
+
+    sha256sum netbird-systemtray-*.png
+
+    c50cc0439620539802ca65e679ddfbb8133ee25d1a98ffbfd52f86ea2ced252b  netbird-systemtray-connected.png
+    56b7a3c3ca50e2bf5d294b31ca39f1fabc1fd384490ab565b6481e8ffe5c2f95  netbird-systemtray-connected-mono-dark.png
+    aafadaaf136d8a62d1cfb5e9b99700a302241edcca01eddb106420b38c38ef23  netbird-systemtray-connecting.png
+    735a6c4eba87c12c87852331a201e988d20535949104894b0fc0412d2a660324  netbird-systemtray-connecting-mono-dark.png
+    71b133636e91eb67f221f64592f64fa04a3b2337f4d616be36492efae0cff643  netbird-systemtray-disconnected.png
+    9026f3d71b82c9008b4cd27562e4e1519e6c649ce6a0b5bb37d7dbffab47e5d4  netbird-systemtray-disconnected-mono-dark.png
+    eb0cb09f427d8bace3ce98c32fc5deb78a9a045dac3fed2d2695110ed7160d14  netbird-systemtray-error.png
+    679b9157a7ba4135506f07b07bb0326426bcdc750edc64d8fac727de190a57c3  netbird-systemtray-error-mono-dark.png
+    eb0cb09f427d8bace3ce98c32fc5deb78a9a045dac3fed2d2695110ed7160d14  netbird-systemtray-needs-login.png
+    679b9157a7ba4135506f07b07bb0326426bcdc750edc64d8fac727de190a57c3  netbird-systemtray-needs-login-mono-dark.png
+
+Upstream licence text
+---------------------
+
+This BSD‑3‑Clause license applies to all parts of the repository except for the directories management/, signal/, relay/ and combined/.
+Those directories are licensed under the GNU Affero General Public License version 3.0 (AGPLv3). See the respective LICENSE files inside each directory.
+
+BSD 3-Clause License
+
+Copyright (c) 2022 NetBird GmbH & AUTHORS
+
+Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
