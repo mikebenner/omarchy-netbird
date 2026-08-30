@@ -981,6 +981,11 @@ function shouldApplyNetworksRead(capturedCompletions, currentCompletions, writeI
 //   busy       refused because another process held the gate. Its own,
 //              deliberately generous budget — but a budget, because an
 //              unbounded knock is a timer loop with no end.
+//   superseded a read that landed *after* a state hook invalidated the lists,
+//              having started before it. Its rows are still worth showing —
+//              a snapshot is not wrong, only old — but it cannot discharge an
+//              obligation created after it began, so the dirty bit survives
+//              and a current read is fetched. Free, like a discard.
 //   blocked    refused for a state reason. There is nothing to retry against:
 //              a timer would only re-ask a state that only an event changes.
 //              The obligation stands, charges nothing, and is re-armed by the
@@ -1000,6 +1005,7 @@ var CORRECTIVE_PROMPT_MS = 250
 var CORRECTIVE_APPLIED = "applied"
 var CORRECTIVE_FAILED = "failed"
 var CORRECTIVE_DISCARDED = "discarded"
+var CORRECTIVE_SUPERSEDED = "superseded"
 var CORRECTIVE_BUSY = "busy"
 var CORRECTIVE_BLOCKED = "blocked"
 
@@ -1020,7 +1026,7 @@ function correctiveStep(outcome, state) {
   if (outcome === CORRECTIVE_APPLIED) {
     return { dirty: false, attempts: 0, busy: 0, retryMs: 0, waitForState: false }
   }
-  if (outcome === CORRECTIVE_DISCARDED) {
+  if (outcome === CORRECTIVE_DISCARDED || outcome === CORRECTIVE_SUPERSEDED) {
     return { dirty: true, attempts: attempts, busy: busy, retryMs: CORRECTIVE_PROMPT_MS, waitForState: false }
   }
   if (outcome === CORRECTIVE_BLOCKED) {
@@ -1050,185 +1056,254 @@ function correctiveStep(outcome, state) {
   }
 }
 
+// A read may only discharge an obligation that already existed when it
+// started. Every state hook that invalidates the lists bumps the request
+// epoch; a read captures the epoch it began under. Ordering against writes
+// (the generation counter) is not enough on its own: a read can start
+// healthy, survive a daemon outage in flight, and exit cleanly afterwards
+// with no write anywhere in between — matching on generation and cancelling
+// the re-read the recovery had just asked for.
+function readSatisfiesRequest(capturedEpoch, currentEpoch) {
+  return nonNegativeCount(capturedEpoch) >= nonNegativeCount(currentEpoch)
+}
+
 // --- profiles ---------------------------------------------------------------
 
-// `netbird profile list` prints a two-column table:
+// `netbird profile list` prints a tabwriter table. With `--show-id` — which
+// this widget always asks for first — it carries the profile's identity:
+//
+//     ID       NAME     ACTIVE
+//     default  default  ✓
+//
+// and without it (an older CLI that does not know the flag) only:
 //
 //     NAME     ACTIVE
 //     default  ✓
 //
-// The header is required. Without it we are looking at a warning, an error, or
-// a future format — and turning arbitrary lines into profiles would put rows in
-// the switcher that run `netbird profile select <that line>` when clicked.
-// Derived from the upstream printer, netbird v0.77.1 `client/cmd/profile.go`:
+// Both shapes are parsed. Derived from the upstream printer, netbird v0.77.1
+// `client/cmd/profile.go`:
 //
-//     tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)   // :114
-//     fmt.Fprintln(tw, "NAME\tACTIVE")                                // :118
-//     marker := ""; if profile.IsActive { marker = "✓" }              // :121-124
-//     fmt.Fprintf(tw, "%s\t%s\n", name, marker)                      // :130
+//     tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)      // :114
+//     fmt.Fprintln(tw, "ID\tNAME\tACTIVE")  / "NAME\tACTIVE"             // :116,:118
+//     marker := ""; if profile.IsActive { marker = "✓" }                 // :121-124
+//     name := profilemanager.StripCtrlChars(profile.Name)                // :125
+//     fmt.Fprintf(tw, "%s\t%s\t%s\n", id.ShortID(), name, marker)        // :128
+//     fmt.Fprintf(tw, "%s\t%s\n", name, marker)                          // :130
 //
-// Four facts fall out of that, and every geometry rule below is one of them.
-// All four were verified by running Go's tabwriter with those exact
-// parameters, not just read off the docs:
+// The geometry rules below are what that printer can emit, and nothing more:
 //
-//   1. padding is 2 and padchar is a space, so tabwriter puts *at least two*
-//      spaces between the columns. A header with a single space is not output
-//      this printer can produce, and every name is followed by at least two
-//      spaces — the column is the widest cell plus the padding.
-//   2. tabwriter pads every cell in a column to the same width, header
-//      included, so the ACTIVE column starts at the same offset on every line
-//      and a name can never overrun into it — the column widens instead.
-//   3. the ACTIVE cell is `marker`, which today is exactly "✓" or exactly "".
-//   4. tabwriter does not pad the *trailing* cell of a line, and it does pad
-//      the name cell even when the marker after it is empty. So an inactive
-//      row is exactly the column width — name plus trailing spaces, nothing
-//      after it — and an active row is that plus a marker beginning on the
-//      boundary. Nothing this printer emits has whitespace past the column.
+//   1. padding is 2 and padchar is a space, so every column is its widest
+//      cell plus two: each cell that is not the last on its line ends in at
+//      least two spaces, header included.
+//   2. tabwriter pads every cell in a column to the same width, so the
+//      columns start at the same offsets on every line and a cell can never
+//      overrun into the next — the column widens instead.
+//   3. tabwriter does not pad the *trailing* cell, so a row with an empty
+//      ACTIVE marker is exactly the column width and nothing this printer
+//      emits carries whitespace past that boundary.
+//   4. **tabwriter measures cells in runes** (`text/tabwriter` counts with
+//      `utf8.RuneCount`), so the offsets are rune offsets. This parser
+//      measures the same way — `Array.from(line)`, one entry per code point
+//      — rather than in UTF-16 code units, which put the boundary mid-name
+//      for any astral-plane character (an emoji is one rune but two code
+//      units) and dropped the row.
 //
-// Rule 4 is what rejects both a line too short to reach the column and one
-// that reaches it with only whitespace beyond ("WARNING oops  ").
+// Identity is the ID column, not the display name. `netbird profile select`
+// "Accepts a name, ID, or unique ID prefix" (`profile select --help`,
+// v0.77.1), so the id is what this widget sends. That matters because names
+// are free-form and need not be unique: upstream tells the user to run
+// `--show-id` to disambiguate (`profile.go:163,322`). With an id in hand the
+// name is display text and never syntax — a leading space, an emoji, two
+// profiles called the same thing, none of it can misroute a selection.
 //
-// What geometry alone cannot reject is a line of prose that happens to align
-// ("WARNING x     danger"): it is the same shape as a row. Rule 3 used to be
-// asked to do that job — an unrecognised marker dropped the row — but that
-// makes the widget lose real profiles the day upstream changes "✓" to
-// anything else, including the active one. So an unrecognised marker is now
-// *kept*, treated as active (see below), and aligned prose is rejected by
-// what it says instead: PROFILE_NON_ROW.
-//
-// The residual, stated plainly: a line under the header that is exactly the
-// column width and opens with none of those words — "looks fine    " — is
-// indistinguishable from an inactive profile of that name, and this parser
-// accepts it. `isKnownProfile` is no defence, since it re-checks the same
-// parse. The consequences are bounded: such a row can only ever run
-// `netbird profile select "looks fine"`, which fails on a name the daemon
-// does not have, and the section only appears at all when the parse produced
-// more than one row.
-//
-// Names come from StripCtrlChars(profile.Name) (:125), so they may contain
-// spaces and non-ASCII but no control characters. One deliberate edge:
-// tabwriter measures cells in runes while this parser slices UTF-16 code
-// units, so a name carrying astral-plane characters (each one rune but two
-// code units) can put the boundary mid-name. Such a row fails the padding
-// check and is dropped — the safe direction: a profile that does not appear
-// can never be mis-selected, and no phantom row is invented.
+// IDs are 32 hex characters, `id.ShortID()`-truncated to the first 8 runes,
+// or the literal `default` (`client/internal/profilemanager/id.go:35-43,
+// :105-114`). A valid id is letters, digits, `_` and `-` only, at most 64
+// characters (`IsValidProfileFilenameStem`, `id.go:46-69`) — never
+// whitespace. That is a positive test for "this line is a table row", which
+// is why the id form needs no prose denylist: `failed oops   ` has a space in
+// its id cell and is not a row.
+var PROFILE_HEADER_WITH_ID = /^ID(\s{2,})NAME(\s{2,})ACTIVE\s*$/
 var PROFILE_HEADER = /^NAME(\s{2,})ACTIVE\s*$/
 var PROFILE_ACTIVE_MARKER = "✓"
-// Lines the CLI, or a library under it, prints that are not table rows. A
-// profile genuinely named "info" is dropped by this; that is the safe
-// direction — a row that does not appear cannot be mis-selected, while a
-// phantom one runs `profile select` against the daemon.
-var PROFILE_NON_ROW = /^\s*[[(]?\s*(?:warn|warning|error|err|erro|info|debug|trace|fatal|panic|usage|note|hint)\b/i
-// A logrus/zap style timestamped log line, whatever severity follows it.
+// The charset `IsValidProfileFilenameStem` accepts, plus its 64-rune cap.
+var PROFILE_ID_SHAPE = /^[\p{L}\p{N}_-]{1,64}$/u
+// Only the id-less table needs these: with no identity column, a line of
+// prose that happens to align is the same shape as a row, so what it says is
+// the only thing left to judge it by. A profile genuinely named "info" is
+// dropped by this on an old CLI; that is the safe direction, and `--show-id`
+// removes the guess entirely.
+var PROFILE_NON_ROW = /^\s*[[(]?\s*(?:warn|warning|error|err|erro|info|debug|trace|fatal|panic|usage|note|hint|failed|failure|cannot|unable)\b/i
 var PROFILE_TIMESTAMPED = /^\s*\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}/
 
-// tabwriter pads a name cell with spaces, and a name may itself end in
-// spaces: `"Work "` and `"Work"` are printed identically, so the padding
-// cannot be told from the name. Trailing spaces are therefore unrecoverable
-// from this format — a profile named `"Work "` parses as `"Work"`, and a
-// select on it will be refused by the daemon rather than silently switching
-// to the wrong account. What must not happen is the two sides disagreeing, so
-// every place a name is compared or sent goes through this one
-// normalisation: the parse, `isKnownProfile`, and the argv in
-// `profileSelectCommand`.
+// Rune-wise, because that is how tabwriter measured when it laid the table
+// out. `Array.from` splits on code points, so a surrogate pair counts once.
+function toRunes(text) {
+  return Array.from(String(text === undefined || text === null ? "" : text))
+}
+
+// A cell is its content plus the padding tabwriter added; the padding is
+// always spaces. Upstream trims a profile name before storing it
+// (`sanitizeDisplayName`, `id.go:71-86`, `strings.TrimSpace`), so a name
+// carries no trailing space of its own and the right-trim recovers it
+// exactly. If a legacy name ever did end in a space, the display would lose
+// it — but the *identity* is the id column, so nothing is mis-selected.
+function trimCellPadding(cell) {
+  return String(cell).replace(/ +$/, "")
+}
+
+// Selection handles are compared and sent after the same trim, so the check
+// and the argv cannot disagree about what was approved.
+function normalizeProfileHandle(handle) {
+  return String(handle === undefined || handle === null ? "" : handle).trim()
+}
+
+// Kept for the id-less table, where the display name is the only identity
+// available.
 function normalizeProfileName(name) {
   return String(name === undefined || name === null ? "" : name).replace(/\s+$/, "")
 }
 
-// Returns `{ ok, profiles }`. `ok` is false only when the output was not the
-// table we asked for — no header. A header with no rows under it is `ok` with
+// Returns `{ ok, hasIds, profiles }`. `ok` is false only when the output was
+// not a table at all — no header. A header with no rows under it is `ok` with
 // an empty list, which the caller applies: treating an empty parse as a read
 // failure turned any format drift into total feature loss plus a retry storm.
 function parseProfileTable(raw) {
-  var text = String(raw === undefined || raw === null ? "" : raw)
-  var lines = text.split(/\r?\n/)
+  var lines = String(raw === undefined || raw === null ? "" : raw).split(/\r?\n/)
 
   var headerAt = -1
+  var hasIds = false
+  var nameAt = 0
   var activeAt = -1
   for (var i = 0; i < lines.length; i++) {
-    var header = lines[i].match(PROFILE_HEADER)
-    if (!header) continue
-    headerAt = i
-    activeAt = "NAME".length + header[1].length
-    break
+    var withId = lines[i].match(PROFILE_HEADER_WITH_ID)
+    if (withId) {
+      headerAt = i
+      hasIds = true
+      nameAt = "ID".length + withId[1].length
+      activeAt = nameAt + "NAME".length + withId[2].length
+      break
+    }
+    var plain = lines[i].match(PROFILE_HEADER)
+    if (plain) {
+      headerAt = i
+      hasIds = false
+      nameAt = 0
+      activeAt = "NAME".length + plain[1].length
+      break
+    }
   }
-  if (headerAt === -1) return { ok: false, profiles: [] }
+  if (headerAt === -1) return { ok: false, hasIds: false, profiles: [] }
 
   var profiles = []
   for (var j = headerAt + 1; j < lines.length; j++) {
     var line = lines[j]
     if (line.trim() === "") continue
-    // Not geometry — what the line says. The only defence against prose that
-    // happens to align with the column.
-    if (PROFILE_NON_ROW.test(line) || PROFILE_TIMESTAMPED.test(line)) continue
+    // Rule 4: rune offsets, because that is what tabwriter padded to.
+    var chars = toRunes(line)
+    if (chars.length < activeAt) continue
 
-    // Rule 4: every row reaches the ACTIVE column, trailing padding and all.
-    if (line.length < activeAt) continue
-    var namePart = line.substring(0, activeAt)
-    var cell = line.substring(activeAt)
+    // Rule 3: the marker is the trailing cell — it begins exactly on the
+    // boundary and is never padded, so nothing sits past the column but the
+    // marker itself.
+    var marker = chars.slice(activeAt).join("")
+    if (marker !== "" && /^\s/.test(marker)) continue
 
-    // Rule 4 again: the trailing cell is written straight onto the boundary
-    // and never padded, so a row is either exactly the column width (cell
-    // "") or the width plus a marker starting on it. Whitespace past the
-    // column is not output this printer can produce.
-    if (cell !== "" && /^\s/.test(cell)) continue
+    // Rule 1: the name cell is padded to its column, so it ends in at least
+    // two spaces. Its *content* is not judged: with an id column the name is
+    // display text, free to start with a space or carry an emoji.
+    var nameCell = chars.slice(nameAt, activeAt).join("")
+    if (!/ {2}$/.test(nameCell)) continue
+    var name = trimCellPadding(nameCell)
+    if (name === "") continue
 
-    // Rule 1/2: the name column is padded to the widest name plus two, so a
-    // row's name always ends in at least two spaces before the boundary.
-    // Prose runs straight through it.
-    if (!/\s\s$/.test(namePart)) continue
+    var id
+    if (hasIds) {
+      var idCell = chars.slice(0, nameAt).join("")
+      if (!/ {2}$/.test(idCell)) continue
+      id = trimCellPadding(idCell)
+      // The positive test that replaces guessing at prose: a real id is a
+      // filename stem, never whitespace and never punctuation.
+      if (!PROFILE_ID_SHAPE.test(id)) continue
+    } else {
+      if (PROFILE_NON_ROW.test(line) || PROFILE_TIMESTAMPED.test(line)) continue
+      // No identity column: the name is the handle, so its shape is back to
+      // being syntax. tabwriter writes the first cell at column zero, so a
+      // row never begins with whitespace.
+      if (/^\s/.test(name)) continue
+      id = normalizeProfileName(name)
+    }
 
-    var name = normalizeProfileName(namePart)
-    // tabwriter writes the first cell at column zero, so a row never begins
-    // with whitespace; and an empty name is not a profile.
-    if (name === "" || /^\s/.test(namePart)) continue
-
-    // Rule 3, held loosely on purpose. "✓" is what v0.77.1 writes, but the
-    // cell is only ever *empty* for an inactive profile, so any non-empty
-    // marker means active. Reading an unknown marker as inactive would be
-    // worse than reading it as active: with no row marked active,
-    // `activeProfile()` returns "" and the panel offers a select of the
-    // profile already in use — and a select recycles the engine.
-    profiles.push({ name: name, active: cell !== "" })
+    // Rule 3 again, held loosely: "✓" is what v0.77.1 writes, but the cell is
+    // only ever *empty* for an inactive profile, so any non-empty marker
+    // means active. Reading an unknown marker as inactive would be worse:
+    // with no row active, the panel offers a select of the profile already in
+    // use, and a select recycles the engine.
+    profiles.push({ id: id, name: name, active: marker !== "" })
   }
-  return { ok: true, profiles: profiles }
+
+  // Two rows that cannot be told apart are not selectable — sending either
+  // handle would be a coin flip between accounts. Real ids are unique, so
+  // this only ever fires on the id-less table.
+  var counts = {}
+  for (var k = 0; k < profiles.length; k++) counts[profiles[k].id] = (counts[profiles[k].id] || 0) + 1
+  for (var m = 0; m < profiles.length; m++) profiles[m].ambiguous = counts[profiles[m].id] > 1
+
+  return { ok: true, hasIds: hasIds, profiles: profiles }
 }
 
 function parseProfileList(raw) {
   return parseProfileTable(raw).profiles
 }
 
-// The belt on top of the parser: `profile select` may only ever be handed a
-// name that the most recently *applied* parse produced. Even if a hostile or
-// future table slipped a row past the rules above, nothing outside this list
-// is selectable. Both sides are normalised the same way the argv is, so the
-// check and the command can never disagree about what the name is.
-function isKnownProfile(profiles, name) {
-  var target = normalizeProfileName(name)
-  if (target === "") return false
+// The belt on top of the parser, and every refusal in one pure place, so the service cannot get the order wrong
+// — in particular, the handle is normalised *before* it is compared to the
+// active row, or `selectProfile("default ")` slips past a raw equality check
+// and then normalises back to the profile already in use.
+function resolveProfileSelection(profiles, handle) {
+  var target = normalizeProfileHandle(handle)
+  if (target === "") return { ok: false, reason: "empty", id: "" }
+
   var list = profiles || []
+  var row = null
+  var matches = 0
   for (var i = 0; i < list.length; i++) {
-    if (list[i] && normalizeProfileName(list[i].name) === target) return true
+    if (list[i] && String(list[i].id) === target) {
+      if (row === null) row = list[i]
+      matches += 1
+    }
   }
-  return false
+  if (row === null) return { ok: false, reason: "unknown", id: "" }
+  if (matches > 1 || row.ambiguous === true) return { ok: false, reason: "ambiguous", id: target }
+  if (row.active === true) return { ok: false, reason: "active", id: target }
+  return { ok: true, reason: "", id: target }
 }
 
-function profileListCommand() {
-  return timeoutPrefix(DAEMON_TIMEOUT_SEC, DAEMON_KILL_GRACE_SEC).concat(["netbird", "profile", "list"])
+function profileListCommand(showId) {
+  var argv = timeoutPrefix(DAEMON_TIMEOUT_SEC, DAEMON_KILL_GRACE_SEC).concat(["netbird", "profile", "list"])
+  return showId === false ? argv : argv.concat(["--show-id"])
 }
 
-function profileSelectCommand(name) {
-  // The same normalisation `isKnownProfile` checks against, so what was
-  // approved is exactly what is sent.
+// A CLI too old to know `--show-id` rejects the whole command; the caller
+// drops the flag and retries rather than losing the feature.
+// Deliberately the flag-parser's own phrases, not the flag's name: a failure
+// that merely dumps the usage text mentions `--show-id` too, and downgrading
+// on that would lose the id column for the session over an unrelated error.
+var UNKNOWN_FLAG = /unknown (?:flag|shorthand flag)|flag provided but not defined/i
+
+function rejectsShowId(exitCode, stderr, stdout) {
+  if (exitCode === 0) return false
+  return UNKNOWN_FLAG.test(String(stderr || "") + "\n" + String(stdout || ""))
+}
+
+function profileSelectCommand(handle) {
+  // The same normalisation `resolveProfileSelection` approved, so what was
+  // checked is exactly what is sent. With `--show-id` this is the profile's
+  // id, which `profile select` accepts alongside a name or a unique prefix.
   return timeoutPrefix(DAEMON_TIMEOUT_SEC, DAEMON_KILL_GRACE_SEC)
-    .concat(["netbird", "profile", "select", normalizeProfileName(name)])
+    .concat(["netbird", "profile", "select", normalizeProfileHandle(handle)])
 }
 
-// --- peer actions -----------------------------------------------------------
-//
-// Both are argv vectors handed to execDetached, never a shell string: a peer
-// address comes from the daemon, and the moment it is interpolated into a
-// command line it is one bad character away from being a command.
 function sshCommand(address) {
   return ["omarchy-launch-terminal", "ssh", String(address)]
 }
@@ -1397,6 +1472,8 @@ if (typeof module !== "undefined") {
     CORRECTIVE_APPLIED: CORRECTIVE_APPLIED,
     CORRECTIVE_FAILED: CORRECTIVE_FAILED,
     CORRECTIVE_DISCARDED: CORRECTIVE_DISCARDED,
+    CORRECTIVE_SUPERSEDED: CORRECTIVE_SUPERSEDED,
+    readSatisfiesRequest: readSatisfiesRequest,
     CORRECTIVE_BUSY: CORRECTIVE_BUSY,
     CORRECTIVE_BLOCKED: CORRECTIVE_BLOCKED,
     parseStatus: parseStatus,
@@ -1427,7 +1504,9 @@ if (typeof module !== "undefined") {
     parseProfileList: parseProfileList,
     parseProfileTable: parseProfileTable,
     normalizeProfileName: normalizeProfileName,
-    isKnownProfile: isKnownProfile,
+    normalizeProfileHandle: normalizeProfileHandle,
+    resolveProfileSelection: resolveProfileSelection,
+    rejectsShowId: rejectsShowId,
     profileListCommand: profileListCommand,
     profileSelectCommand: profileSelectCommand,
     sshCommand: sshCommand,

@@ -248,8 +248,17 @@ read while the panel is open.
 ## Profiles
 
 A **PROFILES** section appears when the daemon knows more than one profile —
-with a single profile there is nothing to choose, so it stays hidden. Picking a
-row runs `netbird profile select <name>`.
+with a single profile there is nothing to choose, so it stays hidden.
+
+The list comes from `netbird profile list --show-id`, and picking a row runs
+`netbird profile select <id>`. Selecting by **ID** rather than by display name
+is deliberate: NetBird names are free-form and need not be unique, so two
+profiles can be called the same thing, and only the ID says which account a
+row is. On a CLI too old to know `--show-id` the widget drops the flag and
+falls back to the two-column table; there the display name is the only handle
+available, and two rows that share one are shown but not selectable — the
+panel says to run `netbird profile list --show-id` instead of guessing which
+account you meant.
 
 Both the PROFILES and NETWORKS sections disappear while a switch is in flight
 and come back when their lists have been re-read: the networks of the account
@@ -310,14 +319,17 @@ Deliberate edges, each chosen over guessing:
   every call is wrapped in `timeout -k 2 8` (`timeout -k 5 130` for the SSO
   login), so the process is killed seconds in.
 
-- `netbird profile list` has no `--json` either, and its table is a
-  space-padded two-column layout, so a profile name that ends in spaces
-  cannot be told from the padding: it is read without them, and selecting it
-  fails on the daemon rather than switching to the wrong account. For the
-  same reason a line of unrecognised prose that happens to be exactly the
-  name column's width can be read as a profile; the section only appears when
-  the parse produced more than one row, and selecting such a row fails on a
-  name the daemon does not have.
+- `netbird profile list` has no `--json` either, so its table is parsed as
+  text against what Go's `text/tabwriter` emits — measured in code points,
+  the way tabwriter measured when it laid the table out, so names carrying
+  emoji or other astral-plane characters are read correctly. With
+  `--show-id` a row is accepted only when its ID cell holds something that
+  can be an ID (letters, digits, `_`, `-`, never a space), which is what
+  keeps a stray line of output from becoming a clickable profile. Without
+  that column — an older CLI — the widget has only the shape of the line to
+  go on: it rejects lines that announce themselves as warnings or errors and
+  lines whose name begins with a space, so a profile named with a leading
+  space would not be listed there.
 - The management-host check that stops the SSO flow opening the daemon's own
   endpoint compares ASCII hostnames. There is no IDNA canonicalisation, so an
   internationalised management URL and its punycode spelling

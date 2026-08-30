@@ -253,7 +253,9 @@ Panel {
     else if (focusSection === "profiles") {
       var list = netbird.profiles || []
       var entry = list[Math.max(0, Math.min(profileIndex, list.length - 1))]
-      if (entry) netbird.selectProfile(entry.name)
+      // The row's identity, never its display name: names are free-form and
+      // need not be unique, so only the id says which account this is.
+      if (entry) netbird.selectProfile(entry.id)
     }
     else if (focusSection === "networks") toggleFocusedNetwork()
     // Enter opens the peer's detail rather than the copy menu: the chevron is
@@ -1176,7 +1178,11 @@ Panel {
     property var profile: null
     property int rowIndex: 0
     readonly property string profileName: profile ? String(profile.name || "") : ""
+    readonly property string profileId: profile ? String(profile.id || "") : ""
     readonly property bool isActive: profile ? profile.active === true : false
+    // Only an id-less table can hold two rows that cannot be told apart; such
+    // a row is shown, because it is a real profile, but it cannot be picked.
+    readonly property bool ambiguous: profile ? profile.ambiguous === true : false
 
     hasCursor: root.cursorActive && root.focusSection === "profiles" && root.profileIndex === rowIndex
     current: isActive
@@ -1220,14 +1226,14 @@ Panel {
     MouseArea {
       anchors.fill: parent
       hoverEnabled: true
-      cursorShape: profileRow.isActive ? Qt.ArrowCursor : Qt.PointingHandCursor
+      cursorShape: profileRow.isActive || profileRow.ambiguous ? Qt.ArrowCursor : Qt.PointingHandCursor
       enabled: !netbird.profilesBusy
       onEntered: {
         root.cursorActive = true
         root.focusSection = "profiles"
         root.profileIndex = profileRow.rowIndex
       }
-      onClicked: netbird.selectProfile(profileRow.profileName)
+      onClicked: netbird.selectProfile(profileRow.profileId)
     }
   }
 

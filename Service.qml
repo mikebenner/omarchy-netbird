@@ -94,6 +94,25 @@ Item {
   // nothing and knocking forever.
   property int _networksBusyRefusals: 0
   property int _profilesBusyRefusals: 0
+  // The generation counter above orders reads against *writes*. This one
+  // orders them against *requests*: every state hook that invalidates a list
+  // — a daemon recovery, the tunnel coming up, the panel opening — bumps the
+  // epoch, and a read that started before the bump may not clear the
+  // obligation the bump created. Without it, a read that began while the
+  // daemon was healthy, survived an outage in flight, and exited cleanly
+  // after the recovery counted as "applied" (no write had happened, so the
+  // generation still matched) and cancelled the post-recovery re-read. Its
+  // rows are still displayed — a snapshot is not wrong to show — but the
+  // obligation stands and the drain goes back for a current one.
+  property int _networksRequestEpoch: 0
+  property int _profilesRequestEpoch: 0
+  property int _networksReadEpoch: 0
+  property int _profilesReadEpoch: 0
+  // `profile list --show-id` carries the identity this widget selects by. A
+  // CLI too old to know the flag rejects the whole command, so the first such
+  // refusal drops the flag for the rest of the session and the retry parses
+  // the two-column table instead.
+  property bool _profileListShowId: true
 
   property var profiles: []
   property bool profilesLoaded: false
@@ -259,12 +278,15 @@ Item {
       _profilesDirty = true
       _profilesAttempts = 0
       _profilesBusyRefusals = 0
+      // Nothing already in flight can satisfy this request.
+      _profilesRequestEpoch += 1
       profilesDirtyDrain.interval = Model.CORRECTIVE_PROMPT_MS
       profilesDirtyDrain.restart()
     } else {
       _networksDirty = true
       _networksAttempts = 0
       _networksBusyRefusals = 0
+      _networksRequestEpoch += 1
       networksDirtyDrain.interval = Model.CORRECTIVE_PROMPT_MS
       networksDirtyDrain.restart()
     }
@@ -313,8 +335,10 @@ Item {
       return _noteCorrective("networks", Model.CORRECTIVE_BUSY)
     }
     // The dirty bit is NOT cleared here. Starting a read fulfils nothing;
-    // only its successful apply in onExited does.
+    // only its successful apply in onExited does — and only if it started
+    // late enough to answer the newest request.
     _networkReadGeneration = _networkGeneration
+    _networksReadEpoch = _networksRequestEpoch
     networksStdout.reset()
     networksStderr.reset()
     networksProcess.command = Model.networksListCommand()
@@ -384,37 +408,74 @@ Item {
       return _noteCorrective("profiles", Model.CORRECTIVE_BUSY)
     }
     // Not cleared here — only a successful apply in onExited clears it.
+    _profilesReadEpoch = _profilesRequestEpoch
     profilesStdout.reset()
     profilesStderr.reset()
-    profilesProcess.command = Model.profileListCommand()
+    profilesProcess.command = Model.profileListCommand(_profileListShowId)
     profilesProcess.running = true
     return true
   }
 
+  // The display name of the active profile, for the panel. Identity is the id
+  // below; this is only ever text on screen.
   function activeProfile() {
     var list = profiles || []
     for (var i = 0; i < list.length; i++) if (list[i] && list[i].active === true) return String(list[i].name)
     return ""
   }
 
-  function selectProfile(name) {
-    var target = String(name || "")
-    if (target === "" || target === activeProfile()) return false
-    // The belt behind the parser: only a name from the most recently APPLIED
-    // parsed list may be selected. Whatever a hostile or future table might
-    // sneak past the parse rules, it cannot be handed to `profile select`
-    // unless it is one of the rows on screen.
-    if (!Model.isKnownProfile(profiles, target)) return false
+  function profileDisplayName(handle) {
+    var target = Model.normalizeProfileHandle(handle)
+    var list = profiles || []
+    for (var i = 0; i < list.length; i++) {
+      if (list[i] && String(list[i].id) === target) return String(list[i].name || target)
+    }
+    return target
+  }
+
+  // `handle` is a row's id — the ID column when the CLI gave us one, the
+  // display name on an older CLI that cannot. Every refusal is decided in
+  // `Model.resolveProfileSelection`, including normalising the handle before
+  // it is compared with the active row: comparing the raw value first let
+  // `selectProfile("default ")` past the check and then normalised it back to
+  // the profile already in use, re-cycling the engine for nothing.
+  function selectProfile(handle) {
+    var decision = Model.resolveProfileSelection(profiles, handle)
+    if (!decision.ok) {
+      // The one refusal a person can act on: two rows that cannot be told
+      // apart, which only an id-less table can produce.
+      if (decision.reason === "ambiguous") {
+        actionStatus = "Two profiles share that name — run `netbird profile list --show-id`"
+        actionStatusTimer.restart()
+      }
+      return false
+    }
     // Serialised against every other command: switching recycles the engine,
     // so it must not overlap a toggle, a login, or a network change — and a
     // stale list must not be the thing being selected from.
     if (!installed || daemonDown || mutating || profilesProcess.running) return false
-    actionStatus = "Switching to profile " + target + "…"
+    actionStatus = "Switching to profile " + profileDisplayName(decision.id) + "…"
     profileActionStdout.reset()
     profileActionStderr.reset()
-    profileActionProcess.command = Model.profileSelectCommand(target)
+    profileActionProcess.command = Model.profileSelectCommand(decision.id)
     profileActionProcess.running = true
+    // Both sections belong to the old account from the moment the switch
+    // starts, not from the moment it ends: the README says they disappear
+    // while switching, and leaving them up for the seconds an engine recycle
+    // takes showed the previous account's rows as if they were current.
+    // Cleared only after the process is running, so a refused switch never
+    // blanks the panel.
+    _dropAccountLists()
     return true
+  }
+
+  // Everything that describes the account being left. Called when a switch
+  // starts and again when it exits, since the exit also owes fresh reads.
+  function _dropAccountLists() {
+    profilesLoaded = false
+    networksLoaded = false
+    networks = []
+    networkDesired = {}
   }
 
   // Both are argv vectors, never a shell string: the address comes from the
@@ -486,11 +547,17 @@ Item {
     peers = []
   }
 
-  function parseStatus(raw) {
+  // `truncated` is the collector's own flag for the output this document came
+  // from. A status that exits 0 with an unparseable document is a failure
+  // like any other, and it is exactly the case the cap can cause — so it
+  // reports through the same formatter, and says `(output truncated)` when
+  // lines were dropped. Reporting the parse error bare was the one path that
+  // did not, contradicting the README.
+  function parseStatus(raw, truncated) {
     var parsed = Model.parseStatus(raw, Date.now())
     if (!parsed.ok) {
       resetUnavailable(parsed.message || "Status error")
-      lastError = parsed.error || "Failed to parse netbird status"
+      lastError = Model.failureText(parsed.error, "", "Failed to parse netbird status", truncated === true)
       console.warn("netbird", lastError)
       return
     }
@@ -824,10 +891,11 @@ Item {
       // daemon quotes dial failures inside its own JSON (an unreachable relay
       // in `relays.details[].error`), and reading those as evidence about the
       // daemon itself declared a working tunnel dead.
+      var truncated = statusStdout.truncated || statusStderr.truncated
       var parsed = exitCode === 0 ? Model.parseStatus(stdout, Date.now()) : null
       if (parsed && parsed.ok && !parsed.unavailable) {
         root.clearDaemonDown()
-        root.parseStatus(stdout)
+        root.parseStatus(stdout, truncated)
         return
       }
 
@@ -843,7 +911,7 @@ Item {
       // unusable output is not the daemon saying it is back, and treating it
       // as such reset the backoff on every garbage reply.
       if (exitCode === 0) {
-        root.parseStatus(stdout)
+        root.parseStatus(stdout, truncated)
         return
       }
       // A non-zero exit that still printed a whole status document knows more
@@ -854,7 +922,7 @@ Item {
       // all-defaults "Unknown".
       var salvaged = Model.parseStatus(stdout, Date.now())
       if (salvaged.ok && !salvaged.unavailable) {
-        root.parseStatus(stdout)
+        root.parseStatus(stdout, truncated)
         root.lastError = Model.failureText(stderr, "", "", statusStderr.truncated)
         return
       }
@@ -897,8 +965,11 @@ Item {
       root.networks = Model.parseNetworksList(String(networksStdout.tail || ""))
       root.networksLoaded = true
       root.networkDesired = {}
-      // Applied: this is the only place the obligation is fulfilled.
-      root._noteCorrective("networks", Model.CORRECTIVE_APPLIED)
+      // The rows are shown either way — a snapshot is not wrong to display —
+      // but a read that started before the newest request cannot discharge
+      // it: the obligation stands and the drain fetches a current list.
+      root._noteCorrective("networks", Model.readSatisfiesRequest(root._networksReadEpoch, root._networksRequestEpoch)
+        ? Model.CORRECTIVE_APPLIED : Model.CORRECTIVE_SUPERSEDED)
     }
   }
 
@@ -915,16 +986,26 @@ Item {
       // default profile — which turned any format drift into the section
       // disappearing plus three spawns per trigger. A parsed table with no
       // rows is an answer, so it is applied.
+      // A CLI that does not know `--show-id` rejects the command outright.
+      // Drop the flag for the rest of the session; the ordinary failure
+      // budget carries the retry, which parses the two-column table.
+      if (root._profileListShowId
+          && Model.rejectsShowId(exitCode, String(profilesStderr.tail || ""), String(profilesStdout.tail || ""))) {
+        root._profileListShowId = false
+        root._noteCorrective("profiles", Model.CORRECTIVE_FAILED)
+        return
+      }
       var parsed = exitCode === 0
         ? Model.parseProfileTable(String(profilesStdout.tail || ""))
-        : { ok: false, profiles: [] }
+        : { ok: false, hasIds: false, profiles: [] }
       if (!parsed.ok) {
         root._noteCorrective("profiles", Model.CORRECTIVE_FAILED)
         return
       }
       root.profiles = parsed.profiles
       root.profilesLoaded = true
-      root._noteCorrective("profiles", Model.CORRECTIVE_APPLIED)
+      root._noteCorrective("profiles", Model.readSatisfiesRequest(root._profilesReadEpoch, root._profilesRequestEpoch)
+        ? Model.CORRECTIVE_APPLIED : Model.CORRECTIVE_SUPERSEDED)
     }
   }
 
@@ -953,10 +1034,7 @@ Item {
       // are re-read, so both are dropped rather than left on screen: the
       // networks of an account this machine is no longer on are not
       // selectable, and clicking one would send an id from it.
-      root.profilesLoaded = false
-      root.networksLoaded = false
-      root.networks = []
-      root.networkDesired = {}
+      root._dropAccountLists()
       // An action is a natural trigger: fresh budgets, both lists owed.
       root.requestLists()
       delayedRefresh.restart()

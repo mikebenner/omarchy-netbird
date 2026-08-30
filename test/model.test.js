@@ -1052,11 +1052,39 @@ test("relay details are parsed for the expandable relay list", () => {
 
 // --- profiles ---------------------------------------------------------------
 
-// Exactly the table `netbird profile list` prints on 0.77.1:
-//     NAME     ACTIVE
-//     default  ✓
-// The table Go's tabwriter emits: the NAME column is padded so the ACTIVE
-// column starts at a fixed offset the header itself declares.
+// Both tables below were produced by running Go's `text/tabwriter` with the
+// upstream printer's exact parameters — `tabwriter.NewWriter(out, 0, 0, 2,
+// ' ', 0)`, `ID\tNAME\tACTIVE` / `NAME\tACTIVE`, marker `"✓"` or `""`
+// (netbird v0.77.1, client/cmd/profile.go:114-131) — over six profiles chosen
+// to exercise every edge the reviewer raised: an emoji (astral-plane) name, a
+// leading-space name, two profiles sharing a display name, and a name with
+// two internal spaces. They are byte-exact copies of that output.
+const GO_TABLE_WITH_IDS = [
+  "ID        NAME          ACTIVE",
+  "default   default       ",
+  "a1b2c3d4  😀 party       ✓",
+  "9f8e7d6c   leading      ",
+  "11112222  Work          ",
+  "33334444  Work          ",
+  "55556666  büro  spaced  ",
+  ""
+].join("\n")
+
+const GO_TABLE_NO_IDS = [
+  "NAME          ACTIVE",
+  "default       ",
+  "😀 party       ✓",
+  " leading      ",
+  "Work          ",
+  "Work          ",
+  "büro  spaced  ",
+  ""
+].join("\n")
+
+// Exactly what this machine prints, with one profile, in both shapes.
+const LIVE_TABLE_WITH_IDS = "ID       NAME     ACTIVE\ndefault  default  ✓\n"
+const LIVE_TABLE = "NAME     ACTIVE\ndefault  ✓\n"
+
 const PROFILE_TABLE = [
   "NAME          ACTIVE",
   "default       ",
@@ -1065,113 +1093,203 @@ const PROFILE_TABLE = [
   ""
 ].join("\n")
 
-test("parseProfileList reads the table and marks the active profile", () => {
-  // Exactly what this machine prints, with one profile.
-  assert.deepEqual(Model.parseProfileList("NAME     ACTIVE\ndefault  ✓\n"), [{ name: "default", active: true }])
+test("the --show-id table carries an identity for every row", () => {
+  const table = Model.parseProfileTable(LIVE_TABLE_WITH_IDS)
+  assert.equal(table.ok, true)
+  assert.equal(table.hasIds, true)
+  assert.deepEqual(table.profiles, [{ id: "default", name: "default", active: true, ambiguous: false }])
+})
 
-  // Profile names are free-form: spaces and non-ASCII must survive intact.
-  // Splitting on whitespace truncated "Work Account" and dropped "büro".
-  assert.deepEqual(Model.parseProfileList(PROFILE_TABLE), [
-    { name: "default", active: false },
-    { name: "Work Account", active: true },
-    { name: "büro", active: false }
+test("the id-less table an older CLI prints still parses", () => {
+  // `--show-id` is a 0.77 flag; a CLI without it prints two columns, and the
+  // widget falls back to identity-by-name rather than losing the feature.
+  const table = Model.parseProfileTable(LIVE_TABLE)
+  assert.equal(table.ok, true)
+  assert.equal(table.hasIds, false)
+  assert.deepEqual(table.profiles, [{ id: "default", name: "default", active: true, ambiguous: false }])
+
+  assert.deepEqual(Model.parseProfileList(PROFILE_TABLE).map((p) => [p.id, p.name, p.active]), [
+    ["default", "default", false],
+    ["Work Account", "Work Account", true],
+    ["büro", "büro", false]
   ])
 })
 
-test("parseProfileList refuses anything that is not the table", () => {
-  // No header: nothing is a row, however table-like it looks.
-  assert.deepEqual(Model.parseProfileList("default  ✓\n"), [])
-  for (const raw of ["", "   ", null, undefined, "no profiles"]) {
-    assert.deepEqual(Model.parseProfileList(raw), [])
+test("identity is the id, so two profiles with one name stay distinct", () => {
+  // NetBird names are free-form and need not be unique — upstream tells the
+  // user to run `--show-id` to disambiguate. Selecting by display name could
+  // only ever pick one of them, or be refused as ambiguous by the daemon.
+  const rows = Model.parseProfileTable(GO_TABLE_WITH_IDS).profiles
+  const works = rows.filter((p) => p.name === "Work")
+  assert.equal(works.length, 2)
+  assert.deepEqual(works.map((p) => p.id), ["11112222", "33334444"])
+  assert.equal(works.every((p) => p.ambiguous === false), true, "distinct ids are not ambiguous")
+
+  // Each row resolves to its own identity, and that identity is what argv
+  // carries — `profile select` accepts a name, an ID, or a unique ID prefix.
+  for (const row of works) {
+    const decision = Model.resolveProfileSelection(rows, row.id)
+    assert.deepEqual(decision, { ok: true, reason: "", id: row.id })
+    assert.deepEqual(Model.profileSelectCommand(decision.id),
+      ["timeout", "-k", "2", "8", "netbird", "profile", "select", row.id])
   }
+})
+
+test("the active-profile refusal normalises before it compares", () => {
+  // `selectProfile("default ")` used to pass the raw equality check against
+  // the active name and then normalise back to it in the argv — re-cycling
+  // the engine to switch to the profile already in use.
+  const rows = Model.parseProfileTable(LIVE_TABLE_WITH_IDS).profiles
+  assert.equal(Model.resolveProfileSelection(rows, "default").reason, "active")
+  assert.equal(Model.resolveProfileSelection(rows, "default ").reason, "active")
+  assert.equal(Model.resolveProfileSelection(rows, "  default  ").reason, "active")
+  assert.equal(Model.resolveProfileSelection(rows, "").reason, "empty")
+  assert.equal(Model.resolveProfileSelection(rows, "other").reason, "unknown")
+  assert.equal(Model.resolveProfileSelection(null, "default").reason, "unknown")
+})
+
+test("without an id column, two identical names are refused rather than guessed", () => {
+  const rows = Model.parseProfileTable(GO_TABLE_NO_IDS).profiles
+  const works = rows.filter((p) => p.name === "Work")
+  assert.equal(works.length, 2)
+  assert.equal(works.every((p) => p.ambiguous === true), true)
+  const decision = Model.resolveProfileSelection(rows, "Work")
+  assert.equal(decision.ok, false)
+  assert.equal(decision.reason, "ambiguous", "a coin flip between accounts is not a selection")
+
+  // Unambiguous rows in the same table are unaffected.
+  assert.equal(Model.resolveProfileSelection(rows, "büro  spaced").ok, true)
+})
+
+test("a line whose id cell is not an id is not a row", () => {
+  // The reviewer's phantom: prose that happens to fit the column geometry.
+  // With ids the test is positive rather than a denylist — an id is a
+  // filename stem (letters, digits, `_`, `-`), so it can never hold a space.
+  assert.deepEqual(Model.parseProfileList("ID            NAME          ACTIVE\nfailed oops   whatever      \n"), [])
+  assert.deepEqual(Model.parseProfileList("ID            NAME          ACTIVE\nhttp://x/y    whatever      \n"), [])
+  assert.deepEqual(Model.parseProfileList("ID            NAME          ACTIVE\n              whatever      \n"), [])
+
+  // And the id-less table, which has no such column, still refuses it.
+  assert.deepEqual(Model.parseProfileList("NAME          ACTIVE\nfailed oops   \n"), [])
+  assert.deepEqual(Model.parseProfileList("NAME          ACTIVE\nWARNING x     danger\n"), [])
+})
+
+test("legal names survive: a leading space, an emoji, and doubled spaces", () => {
+  // Measured in runes, the way tabwriter measured when it laid the table out.
+  // Measuring in UTF-16 code units put the boundary mid-name for the emoji
+  // row and dropped it; treating name content as syntax dropped the
+  // leading-space row. With an id column the name is display text only.
+  const rows = Model.parseProfileTable(GO_TABLE_WITH_IDS).profiles
+  assert.deepEqual(rows.map((p) => p.name),
+    ["default", "😀 party", " leading", "Work", "Work", "büro  spaced"])
+  assert.equal(rows[1].active, true, "the emoji row's marker is still read")
+  assert.equal(rows.filter((p) => p.active).length, 1)
+
+  // The emoji row also survives the id-less table: rune measurement is what
+  // fixes it, and that is common to both shapes.
+  assert.equal(Model.parseProfileTable(GO_TABLE_NO_IDS).profiles.some((p) => p.name === "😀 party"), true)
+})
+
+test("upstream trims a name, so the padding right-trim recovers it exactly", () => {
+  // `sanitizeDisplayName` TrimSpaces before storing (id.go:71-86), so a name
+  // carries no trailing space of its own and nothing is lost. If a legacy
+  // name ever did, only the *display* would differ — identity is the id.
+  const rows = Model.parseProfileTable("ID        NAME  ACTIVE\nab12cd34  Work  ✓\n").profiles
+  assert.deepEqual(rows.map((p) => [p.id, p.name, p.active]), [["ab12cd34", "Work", true]])
+  assert.equal(Model.normalizeProfileHandle("  ab12cd34 "), "ab12cd34")
+  assert.equal(Model.normalizeProfileName("Work  "), "Work")
+})
+
+test("parseProfileTable refuses anything that is not a table", () => {
+  assert.deepEqual(Model.parseProfileTable("default  ✓\n"), { ok: false, hasIds: false, profiles: [] })
+  for (const raw of ["", "   ", null, undefined, "no profiles"]) {
+    assert.equal(Model.parseProfileTable(raw).ok, false)
+  }
+  // A header with no rows is an answer, not a failure.
+  assert.deepEqual(Model.parseProfileTable("ID  NAME  ACTIVE\n"), { ok: true, hasIds: true, profiles: [] })
 
   // A warning *before* the header still parses — the header anchors it.
   assert.deepEqual(
     Model.parseProfileList("WARNING failed to open log file\nNAME     ACTIVE\ndefault  ✓\n").map((p) => p.name),
     ["default"]
   )
-
-  // A warning *after* the table must not become a selectable profile: its
-  // words run straight through the column boundary instead of being padded.
-  const trailing = PROFILE_TABLE + "WARNING failed to read cache\n"
-  assert.deepEqual(Model.parseProfileList(trailing).map((p) => p.name), ["default", "Work Account", "büro"])
-
-  // A line too short to reach the ACTIVE column is not a row either: the
-  // printer pads the name cell even before an empty marker, so every real row
-  // reaches the column, trailing spaces and all.
+  // A warning *after* the table does not become a row.
+  assert.deepEqual(Model.parseProfileList(PROFILE_TABLE + "WARNING failed to read cache\n").map((p) => p.name),
+    ["default", "Work Account", "büro"])
+  // A line too short to reach the ACTIVE column is not a row.
   assert.deepEqual(Model.parseProfileList("NAME          ACTIVE\nshort\n"), [])
 })
 
 test("printer-impossible tables yield no phantom or mis-split rows", () => {
-  // Two tables from review, each aligned closely enough to fool a heuristic
-  // but impossible for the real printer — v0.77.1 client/cmd/profile.go,
-  // tabwriter.NewWriter(out, 0, 0, 2, ' ', 0).
-  //
-  // A single-space header: tabwriter pads the NAME column to its widest cell
-  // plus 2, and "NAME" is itself 4 wide, so ACTIVE can never start closer
-  // than "NAME  ACTIVE". No header means no table — and in particular "Work"
-  // is NOT read out of "Work  Account ✓" as a selectable profile.
+  // A single-space header: tabwriter pads a column to its widest cell plus 2,
+  // and "NAME" is itself 4 wide, so ACTIVE can never start closer than
+  // "NAME  ACTIVE". No header means no table — in particular "Work" is NOT
+  // read out of "Work  Account ✓".
   assert.deepEqual(Model.parseProfileList("NAME ACTIVE\nWork  Account ✓\n"), [])
-
-  // Trailing prose that happens to align with the boundary: geometry alone
-  // accepts it ("WARNING x" plus spaces reaches the ACTIVE column), but the
-  // printer writes exactly "✓" or "" there — never "danger" — so the line is
-  // rejected rather than becoming active profile "WARNING x".
-  assert.deepEqual(Model.parseProfileList("NAME          ACTIVE\nWARNING x     danger\n"), [])
+  // Whitespace past the trailing cell is not something tabwriter emits.
+  assert.deepEqual(Model.parseProfileList("NAME          ACTIVE\nlooks fine      \n"), [])
+  assert.deepEqual(Model.parseProfileList("ID        NAME      ACTIVE\nab12cd34  fine        \n"), [])
 })
 
 test("the narrowest table the printer can emit parses back", () => {
-  // Verified by running Go's tabwriter with the printer's exact parameters:
-  // with every name shorter than "NAME" the column is len("NAME") + 2 wide —
-  // the two-space minimum — and the inactive row still carries its padding
-  // out to the ACTIVE column.
-  assert.deepEqual(Model.parseProfileList("NAME  ACTIVE\nNB    \n"), [{ name: "NB", active: false }])
+  // Every cell shorter than its header: the column is the header plus the
+  // two-space minimum, and the inactive row still carries padding out to it.
+  assert.deepEqual(Model.parseProfileList("NAME  ACTIVE\nNB    \n"), [{ id: "NB", name: "NB", active: false, ambiguous: false }])
+  assert.deepEqual(Model.parseProfileList("ID  NAME  ACTIVE\nx   NB    \n"),
+    [{ id: "x", name: "NB", active: false, ambiguous: false }])
 })
 
-test("only names from the applied list are selectable", () => {
+test("only identities from the applied list are selectable", () => {
   // The belt behind the parser: whatever a future or hostile table might
-  // sneak past the rules, `selectProfile` refuses any name the most recently
-  // applied parse did not produce.
-  const list = Model.parseProfileList(PROFILE_TABLE)
-  assert.equal(Model.isKnownProfile(list, "Work Account"), true)
-  assert.equal(Model.isKnownProfile(list, "büro"), true)
-  assert.equal(Model.isKnownProfile(list, "Work"), false)
-  assert.equal(Model.isKnownProfile(list, "WARNING x"), false)
-  assert.equal(Model.isKnownProfile(list, ""), false)
-  assert.equal(Model.isKnownProfile([], "default"), false)
-  assert.equal(Model.isKnownProfile(null, "default"), false)
+  // sneak past the rules, nothing outside the rows on screen is selectable.
+  const rows = Model.parseProfileTable(GO_TABLE_WITH_IDS).profiles
+  assert.equal(Model.resolveProfileSelection(rows, "a1b2c3d4").reason, "active", "known, and the active row")
+  assert.equal(Model.resolveProfileSelection(rows, " a1b2c3d4 ").reason, "active", "normalised on both sides")
+  assert.equal(Model.resolveProfileSelection(rows, "😀 party").reason, "unknown",
+    "the display name is not a handle when an id column exists")
+  assert.equal(Model.resolveProfileSelection(rows, "WARNING x").reason, "unknown")
+  assert.equal(Model.resolveProfileSelection(rows, "").reason, "empty")
+  assert.equal(Model.resolveProfileSelection([], "default").reason, "unknown")
+  assert.equal(Model.resolveProfileSelection(undefined, "default").reason, "unknown")
 })
 
-// Free-form names and argv are a pair: the parser now returns names with
-// spaces and non-ASCII in them, so the command builder has to keep each one a
-// single argument. A name that round-trips through both is the real contract.
-test("a free-form profile name survives parse and stays one argument", () => {
-  const table = ["NAME          ACTIVE", "default       ✓", "Work Account  ", "büro          ", ""].join("\n")
-  const parsed = Model.parseProfileList(table)
-  assert.deepEqual(parsed.map((p) => p.name), ["default", "Work Account", "büro"])
-
-  for (const profile of parsed) {
-    const argv = Model.profileSelectCommand(profile.name)
-    // The name is exactly one element, unsplit and unescaped.
+test("a free-form profile name never becomes shell syntax", () => {
+  // Whatever the handle is, it stays exactly one argv element.
+  const rows = Model.parseProfileTable(GO_TABLE_NO_IDS).profiles
+  for (const row of rows) {
+    const argv = Model.profileSelectCommand(row.id)
     assert.equal(argv.length, 8)
-    assert.equal(argv[argv.length - 1], profile.name)
+    assert.equal(argv[argv.length - 1], row.id)
     assert.deepEqual(argv.slice(0, 7), ["timeout", "-k", "2", "8", "netbird", "profile", "select"])
   }
-
-  // And the same holds for a name carrying shell metacharacters.
   const nasty = "prod; rm -rf ~ && echo"
-  const argv = Model.profileSelectCommand(nasty)
-  assert.equal(argv[argv.length - 1], nasty)
-  assert.equal(argv.length, 8)
-})
-
-test("profile commands are timeout-wrapped argv vectors", () => {
-  assert.deepEqual(Model.profileListCommand(), ["timeout", "-k", "2", "8", "netbird", "profile", "list"])
-  assert.deepEqual(Model.profileSelectCommand("work"), ["timeout", "-k", "2", "8", "netbird", "profile", "select", "work"])
-  // A hostile name stays one argv element rather than becoming shell syntax.
-  const nasty = "work; rm -rf ~"
   assert.deepEqual(Model.profileSelectCommand(nasty).slice(-1), [nasty])
   assert.equal(Model.profileSelectCommand(nasty).length, 8)
+})
+
+test("profile commands are timeout-wrapped argv vectors, id-first", () => {
+  assert.deepEqual(Model.profileListCommand(),
+    ["timeout", "-k", "2", "8", "netbird", "profile", "list", "--show-id"])
+  assert.deepEqual(Model.profileListCommand(true),
+    ["timeout", "-k", "2", "8", "netbird", "profile", "list", "--show-id"])
+  // The fallback for a CLI that does not know the flag.
+  assert.deepEqual(Model.profileListCommand(false),
+    ["timeout", "-k", "2", "8", "netbird", "profile", "list"])
+  assert.deepEqual(Model.profileSelectCommand("ab12cd34"),
+    ["timeout", "-k", "2", "8", "netbird", "profile", "select", "ab12cd34"])
+})
+
+test("a CLI that rejects --show-id is recognised, not retried forever", () => {
+  assert.equal(Model.rejectsShowId(1, "unknown flag: --show-id", ""), true)
+  assert.equal(Model.rejectsShowId(1, "", "Error: unknown shorthand flag"), true)
+  assert.equal(Model.rejectsShowId(1, "flag provided but not defined: -show-id", ""), true)
+  // A real failure that has nothing to do with the flag keeps the flag.
+  assert.equal(Model.rejectsShowId(1, "failed to connect to daemon", ""), false)
+  // And a successful read never downgrades, whatever it printed.
+  assert.equal(Model.rejectsShowId(0, "unknown flag: --show-id", ""), false)
+  // A failure that merely dumps the usage text mentions the flag too; that
+  // must not cost the session its id column.
+  assert.equal(Model.rejectsShowId(1, "Error: daemon unavailable\nFlags:\n  --show-id   show the profile ID column", ""), false)
 })
 
 // --- peer actions -----------------------------------------------------------
@@ -1503,6 +1621,59 @@ test("a networks read that spans a profile switch is discarded, not applied", ()
   assert.equal(Model.shouldApplyNetworksRead(fresh, generation, false), true)
 })
 
+// --- request epochs ---------------------------------------------------------
+
+test("a read that started before a recovery cannot discharge the recovery's request", () => {
+  // The reviewer's five-step sequence, exactly.
+  let generation = 0        // networks writes; none happen anywhere below
+  let epoch = 0             // bumped by every state hook that invalidates
+  let dirty = false
+  let state = { attempts: 0, busy: 0 }
+
+  // 1. A read starts while everything is healthy.
+  const readGeneration = generation
+  const readEpoch = epoch
+
+  // 2. The daemon goes down; the displayed networks are cleared.
+  // 3. It comes back while that read is still running. The recovery hook asks
+  //    for a fresh list — the request the old read must not be allowed to
+  //    satisfy — and the drain finds the old process still in the way.
+  epoch += 1
+  dirty = true
+  state = Model.correctiveStep(Model.CORRECTIVE_BUSY, state)
+  assert.equal(state.dirty, true)
+  assert.equal(state.attempts, 0, "being busy is not the daemon failing")
+
+  // 4. The pre-recovery process exits cleanly. No write happened, so the
+  //    generation still matches and its rows are applied…
+  assert.equal(Model.shouldApplyNetworksRead(readGeneration, generation, false), true)
+  // …but it started under an older request, so it discharges nothing.
+  assert.equal(Model.readSatisfiesRequest(readEpoch, epoch), false)
+  state = Model.correctiveStep(Model.CORRECTIVE_SUPERSEDED, state)
+
+  // 5. Previously this cleared the obligation and nothing fetched a
+  //    post-recovery snapshot. Now the obligation stands and a prompt re-read
+  //    is scheduled, at no cost to either budget.
+  assert.equal(state.dirty, true, "the recovery's request survives the old read")
+  assert.equal(state.retryMs, Model.CORRECTIVE_PROMPT_MS)
+  assert.equal(state.attempts, 0)
+  assert.equal(state.busy, 1)
+
+  // The read that follows started under the current epoch and does discharge it.
+  const freshEpoch = epoch
+  assert.equal(Model.readSatisfiesRequest(freshEpoch, epoch), true)
+  state = Model.correctiveStep(Model.CORRECTIVE_APPLIED, state)
+  assert.deepEqual(state, { dirty: false, attempts: 0, busy: 0, retryMs: 0, waitForState: false })
+})
+
+test("the epoch rule is monotonic and survives a garbage counter", () => {
+  assert.equal(Model.readSatisfiesRequest(3, 3), true)
+  assert.equal(Model.readSatisfiesRequest(4, 3), true, "a later read answers an older request")
+  assert.equal(Model.readSatisfiesRequest(2, 3), false)
+  assert.equal(Model.readSatisfiesRequest("junk", 0), true)
+  assert.equal(Model.readSatisfiesRequest(-1, 1), false)
+})
+
 // --- profile table ----------------------------------------------------------
 
 test("a profile table with no rows is an answer, not a failed read", () => {
@@ -1528,12 +1699,13 @@ test("an unrecognised ACTIVE marker keeps the row instead of deleting it", () =>
   // unknown marker as inactive would be worse than reading it as active: with
   // no row active, `activeProfile()` is "" and the panel offers a select of
   // the profile already in use, which recycles the engine.
-  assert.deepEqual(Model.parseProfileList("NAME     ACTIVE\ndefault  \nwork     *\n"), [
-    { name: "default", active: false },
-    { name: "work", active: true }
-  ])
-  assert.deepEqual(Model.parseProfileList("NAME     ACTIVE\nwork     yes\n"), [{ name: "work", active: true }])
-  assert.deepEqual(Model.parseProfileList("NAME     ACTIVE\nwork     ✔\n"), [{ name: "work", active: true }])
+  assert.deepEqual(Model.parseProfileList("NAME     ACTIVE\ndefault  \nwork     *\n").map((p) => [p.name, p.active]),
+    [["default", false], ["work", true]])
+  assert.deepEqual(Model.parseProfileList("NAME     ACTIVE\nwork     yes\n").map((p) => p.active), [true])
+  assert.deepEqual(Model.parseProfileList("NAME     ACTIVE\nwork     ✔\n").map((p) => p.active), [true])
+  // Same in the --show-id table, where the id still fixes the identity.
+  assert.deepEqual(Model.parseProfileList("ID        NAME  ACTIVE\nab12cd34  work  *\n").map((p) => [p.id, p.active]),
+    [["ab12cd34", true]])
 })
 
 test("a padded line of prose is not a selectable profile", () => {
@@ -1561,30 +1733,30 @@ test("a padded line of prose is not a selectable profile", () => {
   }
 
   // The narrowest real row still parses — the belts reject prose, not names.
-  assert.deepEqual(Model.parseProfileList("NAME  ACTIVE\nNB    \n"), [{ name: "NB", active: false }])
+  assert.deepEqual(Model.parseProfileList("NAME  ACTIVE\nNB    \n").map((p) => [p.name, p.active]), [["NB", false]])
 })
 
-test("a profile name's own trailing spaces cannot survive the format, so both sides agree", () => {
-  // tabwriter pads with spaces and a name may end in spaces: `"Work "` and
-  // `"Work"` print identically, so the padding cannot be told from the name.
-  // What must not happen is the check and the command disagreeing about what
-  // the name is — a row that is clickable but never selectable. Every side
-  // normalises the same way.
-  const parsed = Model.parseProfileList("NAME     ACTIVE\nWork     ✓\n")
-  assert.deepEqual(parsed, [{ name: "Work", active: true }])
+test("the display name is decoupled from the handle that is sent", () => {
+  // The old parser made the display name the identity, so a name whose
+  // trailing spaces the padding had eaten was clickable but never
+  // selectable. With `--show-id` the two are separate concerns: the name is
+  // whatever the account is called, and the handle is the id — which has no
+  // spaces to lose and is exactly what argv carries.
+  const rows = Model.parseProfileTable(GO_TABLE_WITH_IDS).profiles
+  const emoji = rows.find((p) => p.name === "😀 party")
+  assert.equal(emoji.id, "a1b2c3d4")
+  assert.deepEqual(Model.profileSelectCommand(emoji.id).slice(-1), ["a1b2c3d4"])
+  assert.equal(Model.resolveProfileSelection(rows, emoji.id).ok, false, "it is the active row")
 
-  assert.equal(Model.normalizeProfileName("Work "), "Work")
-  assert.equal(Model.normalizeProfileName("  Work"), "  Work", "only the trailing side is padding")
-  assert.equal(Model.normalizeProfileName(null), "")
+  const leading = rows.find((p) => p.name === " leading")
+  assert.equal(leading.id, "9f8e7d6c")
+  assert.deepEqual(Model.resolveProfileSelection(rows, " 9f8e7d6c "), { ok: true, reason: "", id: "9f8e7d6c" })
 
-  // What the panel clicks, what the belt approves, and what argv carries are
-  // one value.
-  assert.equal(Model.isKnownProfile(parsed, "Work "), true)
-  assert.equal(Model.isKnownProfile(parsed, "Work"), true)
-  assert.deepEqual(Model.profileSelectCommand("Work ").slice(-4), ["netbird", "profile", "select", "Work"])
-  assert.deepEqual(Model.profileSelectCommand(parsed[0].name).slice(-1), ["Work"])
-  assert.equal(Model.isKnownProfile([{ name: "Work " }], "Work"), true,
-    "a stored name with padding still matches the argv sent for it")
+  // On the id-less table the name is the handle, and the normalisation the
+  // check uses is the one the command uses.
+  const named = Model.parseProfileTable(PROFILE_TABLE).profiles
+  assert.equal(Model.resolveProfileSelection(named, "büro ").ok, true)
+  assert.deepEqual(Model.profileSelectCommand("büro ").slice(-1), ["büro"])
 })
 
 // --- failure messages -------------------------------------------------------
@@ -1605,6 +1777,21 @@ test("a failure message says when the output behind it was truncated", () => {
   assert.ok(elided.endsWith("… (output truncated)"))
   assert.ok(elided.length < 170)
   assert.equal(Model.failureText("two\nlines\there", "", "", false), "two lines here")
+})
+
+test("a status that exits zero with an unparseable document also says it was truncated", () => {
+  // The one failure path that used to report the parser's error bare. It is
+  // exactly the case the collector cap can cause, so it is the last place
+  // the note should have been missing.
+  const parsed = Model.parseStatus('{"daemonStatus":"Conn', NOW)
+  assert.equal(parsed.ok, false)
+  assert.ok(String(parsed.error || "") !== "", "the parser explains itself")
+
+  // The composition the service performs on that branch.
+  const shown = Model.failureText(parsed.error, "", "Failed to parse netbird status", true)
+  assert.ok(shown.endsWith("(output truncated)"), shown)
+  assert.ok(shown.length > "(output truncated)".length, "the parser's own words are kept")
+  assert.equal(Model.failureText(parsed.error, "", "Failed to parse netbird status", false).includes("truncated"), false)
 })
 
 // --- admin console ----------------------------------------------------------
@@ -1646,6 +1833,31 @@ test("the README describes the widget that actually ships", () => {
 
   // The backoff claim must not promise a cadence faster than the code allows.
   assert.ok(!/backs off 5 s/.test(readme), "README still claims the raw 5 s backoff")
+})
+
+test("the code keeps the README's promises about a switch in flight", () => {
+  // Two claims that drifted from the code before: the sections disappear for
+  // the whole switch, and selection goes by id. Both are cheap to assert
+  // against the source, and both were wrong while the README said otherwise —
+  // the lists were cleared only when the action *exited*, so the old
+  // account's rows stayed on screen for the seconds a recycle takes.
+  const readme = fs.readFileSync(path.join(__dirname, "..", "README.md"), "utf8")
+  const service = fs.readFileSync(path.join(__dirname, "..", "Service.qml"), "utf8")
+  const panel = fs.readFileSync(path.join(__dirname, "..", "Panel.qml"), "utf8")
+
+  assert.ok(/disappear while a switch is in flight/.test(readme), "the README no longer makes the claim")
+  const select = service.slice(service.indexOf("function selectProfile"), service.indexOf("function _dropAccountLists"))
+  assert.ok(select.includes("_dropAccountLists()"),
+    "selectProfile must drop the old account's lists when the switch starts, not when it ends")
+  assert.ok(service.indexOf("_dropAccountLists()", service.indexOf("profileActionProcess")) > 0,
+    "the action exit still owes the same drop plus fresh reads")
+
+  // And the panel hands over the row's identity, never its display name.
+  assert.ok(panel.includes("netbird.selectProfile(entry.id)"), "the keyboard path must select by id")
+  assert.ok(panel.includes("netbird.selectProfile(profileRow.profileId)"), "the click path must select by id")
+  assert.ok(!/selectProfile\((?:entry|profileRow)\.(?:name|profileName)\)/.test(panel),
+    "no path may select by display name")
+  assert.ok(readme.includes("netbird profile select <id>"), "the README should say what is sent")
 })
 
 test("the manifest does not contradict the code about the admin console", () => {
