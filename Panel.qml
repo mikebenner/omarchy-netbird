@@ -1,0 +1,760 @@
+import QtQuick
+import QtQuick.Controls
+import QtQuick.Layouts
+import Quickshell
+import Quickshell.Io
+import qs.Commons
+import qs.Ui
+
+// NetBird in the Omarchy bar, modeled on the first-party Tailscale widget:
+// a bar icon that reflects the daemon, a keyboard-driven popup with a power
+// switch in the hero, and a peer list with copy actions.
+//
+// What NetBird does not have, this does not show: no exit nodes, no Mullvad,
+// no account switching, and no operator handshake — the daemon socket is
+// world-writable, so status/up/down all run unprivileged.
+Panel {
+  id: root
+  moduleName: "mikebenner.netbird"
+  ipcTarget: "mikebenner.netbird"
+  manageIpc: false
+
+  property string focusSection: "header"
+  property int peerIndex: 0
+  property bool cursorActive: false
+  property bool copyMenuOpen: false
+
+  readonly property color foreground: bar ? bar.foreground : Color.foreground
+  readonly property color urgent: bar ? bar.urgent : Color.urgent
+  readonly property color dim: Qt.darker(foreground, 1.55)
+  readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
+  readonly property bool showSelf: netbird.installed && netbird.active && (netbird.selfIp !== "" || netbird.selfFqdn !== "")
+  readonly property bool showPeers: netbird.active && netbird.peers.length > 0
+  // Only claim the header cursor when the switch is actually on screen —
+  // "header" stays navigable, but an absent CLI leaves nothing to highlight.
+  readonly property bool headerHasCursor: cursorActive && focusSection === "header" && netbird.installed
+  readonly property color iconColor: netbird.active ? foreground : dim
+  readonly property string toggleHint: netbird.active ? "Turn NetBird off" : (netbird.needsLogin ? "Sign in to NetBird" : "Turn NetBird on")
+  readonly property color barIconColor: netbird.active ? barForeground : Qt.darker(barForeground, 1.55)
+  readonly property string barTooltip: netbird.installed
+    ? (netbird.statusText + (netbird.peerCountText !== "" ? " · " + netbird.peerCountText + " peers" : ""))
+    : "NetBird is not installed"
+
+  readonly property string heroMeta: {
+    if (!netbird.installed) return ""
+    if (netbird.needsLogin) return "Sign in to join the network"
+    if (!netbird.active) return "NetBird is disconnected"
+    // Session first: on a self-hosted management domain the two together
+    // outrun the hero's width, and the clock that will drop you off the mesh
+    // is the half worth keeping when one of them has to elide.
+    var parts = []
+    if (netbird.sessionText !== "") parts.push(netbird.sessionText)
+    if (netbird.managementHost !== "") parts.push(netbird.managementHost)
+    return parts.length > 0 ? parts.join(" · ") : "NetBird is connected"
+  }
+
+  readonly property string selfDetail: {
+    var parts = []
+    if (netbird.selfIp !== "") parts.push(netbird.selfIp)
+    if (netbird.relaysTotal > 0) parts.push("relays " + netbird.relaysAvailable + "/" + netbird.relaysTotal)
+    if (netbird.profileName !== "" && netbird.profileName !== "default") parts.push("profile " + netbird.profileName)
+    return parts.join(" · ")
+  }
+
+  readonly property var selfCopyOptions: {
+    var options = []
+    if (netbird.selfName !== "") options.push({ kind: "name", label: netbird.selfName })
+    if (netbird.selfFqdn !== "") options.push({ kind: "fqdn", label: netbird.selfFqdn })
+    if (netbird.selfIp !== "") options.push({ kind: "ip", label: netbird.selfIp })
+    return options
+  }
+
+  function selectedPeer() {
+    if (netbird.peers.length === 0) return null
+    return netbird.peers[Math.max(0, Math.min(peerIndex, netbird.peers.length - 1))]
+  }
+
+  // c / n / d act on whatever the cursor is sitting on, so the same three keys
+  // copy this device's details from the self row and a peer's from the list.
+  function copyIp() {
+    if (focusSection === "self") netbird.copyToClipboard(netbird.selfIp)
+    else netbird.copyPeerIp(selectedPeer())
+  }
+
+  function copyName() {
+    if (focusSection === "self") netbird.copyToClipboard(netbird.selfName)
+    else netbird.copyPeerName(selectedPeer())
+  }
+
+  function copyFqdn() {
+    if (focusSection === "self") netbird.copyToClipboard(netbird.selfFqdn)
+    else netbird.copyPeerFqdn(selectedPeer())
+  }
+
+  function ensureCursor() {
+    if (peerIndex < 0) peerIndex = 0
+    if (peerIndex >= netbird.peers.length) peerIndex = Math.max(0, netbird.peers.length - 1)
+    if (focusSection === "self" && !showSelf) focusSection = showPeers ? "peers" : "header"
+    if (focusSection === "peers" && !showPeers) focusSection = showSelf ? "self" : "header"
+  }
+
+  function moveCursor(dx, dy) {
+    cursorActive = true
+    ensureCursor()
+    if (dy !== 0) {
+      if (focusSection === "header") {
+        if (dy > 0) {
+          if (showSelf) focusSection = "self"
+          else if (showPeers) focusSection = "peers"
+        }
+      } else if (focusSection === "self") {
+        if (dy < 0) focusSection = "header"
+        else if (showPeers) focusSection = "peers"
+      } else if (focusSection === "peers") {
+        if (dy < 0) {
+          if (peerIndex <= 0) focusSection = showSelf ? "self" : "header"
+          else peerIndex--
+        } else if (peerIndex < netbird.peers.length - 1) {
+          peerIndex++
+        }
+      }
+    }
+    ensureCursor()
+    scrollCursorIntoView()
+  }
+
+  function activateCursor() {
+    ensureCursor()
+    if (focusSection === "header") netbird.toggleNetbird()
+    else if (focusSection === "self") selfRow.openCopyMenu()
+    else if (focusSection === "peers") openSelectedPeerCopyMenu()
+  }
+
+  function scrollItemIntoView(item) {
+    if (!panelFlick || !item) return
+    Qt.callLater(function() {
+      if (!item) return
+      var margin = Style.space(6)
+      var point = item.mapToItem(panelFlick.contentItem, 0, 0)
+      var top = point.y
+      var bottom = top + item.height
+      var viewTop = panelFlick.contentY
+      var viewBottom = viewTop + panelFlick.height
+      var maxY = Math.max(0, panelFlick.contentHeight - panelFlick.height)
+      if (top < viewTop + margin) panelFlick.contentY = Math.max(0, top - margin)
+      else if (bottom > viewBottom - margin) panelFlick.contentY = Math.min(maxY, bottom + margin - panelFlick.height)
+    })
+  }
+
+  function scrollCursorIntoView() {
+    if (focusSection === "peers" && peerColumn && peerIndex >= 0 && peerIndex < peerColumn.children.length) scrollItemIntoView(peerColumn.children[peerIndex])
+  }
+
+  function openSelectedPeerCopyMenu() {
+    if (!peerColumn || peerIndex < 0 || peerIndex >= peerColumn.children.length) return
+    var item = peerColumn.children[peerIndex]
+    if (item && item.openCopyMenu) item.openCopyMenu()
+  }
+
+  function setPeerCursor(index) {
+    cursorActive = true
+    focusSection = "peers"
+    peerIndex = index
+    scrollCursorIntoView()
+  }
+
+  function setSelfCursor() {
+    cursorActive = true
+    focusSection = "self"
+  }
+
+  function setHeaderCursor() {
+    cursorActive = true
+    focusSection = "header"
+  }
+
+  implicitWidth: button.implicitWidth
+  implicitHeight: button.implicitHeight
+
+  onOpenedChanged: if (opened) {
+    cursorActive = false
+    if (panelFlick) panelFlick.contentY = 0
+    netbird.refresh()
+    Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+  }
+  onPeerIndexChanged: scrollCursorIntoView()
+  onShowSelfChanged: ensureCursor()
+  onShowPeersChanged: ensureCursor()
+
+  Service {
+    id: netbird
+    settings: root.settings
+  }
+
+  Connections {
+    target: netbird
+    function onPeersChanged() { root.ensureCursor() }
+  }
+
+  IpcHandler {
+    target: root.ipcTarget
+    function open(): void { root.open() }
+    function close(): void { root.close() }
+    function show(): void { root.open() }
+    function hide(): void { root.close() }
+    function toggle(): void { root.toggle() }
+    function refresh(): string { netbird.refresh(); return "ok" }
+    function up(): string { netbird.up(); return "ok" }
+    function down(): string { netbird.down(); return "ok" }
+    function toggleNetbird(): string { netbird.toggleNetbird(); return "ok" }
+    function status(): string { return netbird.summary() }
+  }
+
+  BarIconButton {
+    id: button
+    anchors.fill: parent
+    bar: root.bar
+    tooltipText: root.barTooltip
+    iconComponent: Component {
+      Item {
+        NetbirdIcon {
+          anchors.centerIn: parent
+          iconSize: Style.space(11)
+          color: root.barIconColor
+          badgeColor: root.urgent
+          crossed: !netbird.active && !netbird.needsLogin
+          warning: netbird.needsLogin || netbird.degraded
+        }
+      }
+    }
+    onPressed: function(buttonCode) {
+      if (buttonCode === Qt.RightButton) netbird.toggleNetbird()
+      else if (buttonCode === Qt.MiddleButton) netbird.refresh()
+      else root.toggle()
+    }
+  }
+
+  KeyboardPanel {
+    id: panel
+    anchorItem: button
+    owner: root
+    bar: root.bar
+    open: root.opened
+    focusTarget: keyCatcher
+    contentWidth: panel.fittedContentWidth(Style.space(380))
+    contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(560))
+
+    PanelKeyCatcher {
+      id: keyCatcher
+      anchors.fill: parent
+      blocked: root.copyMenuOpen
+      onMoveRequested: function(dx, dy) {
+        if (!root.cursorActive) { root.cursorActive = true; return }
+        root.moveCursor(dx, dy)
+      }
+      onActivateRequested: if (root.cursorActive) root.activateCursor()
+      onCloseRequested: root.close()
+      onTabRequested: function(direction) { root.switchPanel(direction) }
+      onTextKey: function(t) {
+        if (t === "t" || t === "T") netbird.toggleNetbird()
+        else if (t === "r" || t === "R") netbird.refresh()
+        else if (t === "c" || t === "C") root.copyIp()
+        else if (t === "n" || t === "N") root.copyName()
+        else if (t === "d" || t === "D") root.copyFqdn()
+      }
+
+      Flickable {
+        id: panelFlick
+        anchors.fill: parent
+        contentWidth: width
+        contentHeight: column.implicitHeight
+        clip: true
+        boundsBehavior: Flickable.StopAtBounds
+        flickableDirection: Flickable.VerticalFlick
+        interactive: contentHeight > height
+        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+
+        Column {
+          id: column
+          width: panelFlick.width
+          spacing: Style.space(12)
+
+          Item {
+            id: header
+            width: parent.width
+            implicitHeight: hero.implicitHeight
+            // Exposed for the hero's trailingControl, whose `root` resolves to
+            // PanelHero (not this Panel) — reach panel state via `header`.
+            readonly property bool ringVisible: root.headerHasCursor
+            function focusHero() { root.setHeaderCursor() }
+
+            PanelHero {
+              id: hero
+              width: parent.width
+              title: netbird.installed && netbird.selfName !== "" ? netbird.selfName : "NetBird"
+              meta: root.heroMeta
+              detail: netbird.installed && netbird.peerCountText !== "" ? netbird.peerCountText : ""
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              iconOpacity: netbird.active ? 1.0 : 0.5
+              // Status only — the switch owns toggling, mouse and keyboard alike.
+              iconComponent: Component {
+                NetbirdIcon {
+                  iconSize: Style.font.display
+                  color: root.iconColor
+                  badgeColor: root.urgent
+                  crossed: !netbird.active && !netbird.needsLogin
+                  warning: netbird.needsLogin || netbird.degraded
+                }
+              }
+
+              // Compact on/off switch on the trailing edge of the hero, and the
+              // header's only cursor target. The service already flips `active`
+              // optimistically, so the knob throws the instant you click it.
+              trailingControl: Component {
+                ToggleSwitch {
+                  id: powerSwitch
+                  visible: netbird.installed
+                  checked: netbird.active
+                  busy: netbird.busy
+                  hasCursor: header.ringVisible
+                  foreground: hero.foreground
+                  onHovered: function(on) { if (on) header.focusHero() }
+                  onToggled: netbird.toggleNetbird()
+
+                  PanelToolTip {
+                    visible: powerSwitch.containsMouse
+                    text: root.toggleHint
+                    fontFamily: hero.fontFamily
+                  }
+                }
+              }
+            }
+          }
+
+          Text {
+            visible: netbird.actionStatus !== "" || netbird.lastError !== ""
+            width: parent.width
+            text: netbird.actionStatus !== "" ? netbird.actionStatus : netbird.lastError
+            color: netbird.lastError !== "" && netbird.actionStatus === "" ? root.urgent : root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            wrapMode: Text.WordWrap
+          }
+
+          CursorSurface {
+            visible: !netbird.installed
+            width: parent.width
+            implicitHeight: missingText.implicitHeight + Style.spacing.rowPaddingX
+            foreground: root.foreground
+
+            Text {
+              id: missingText
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              anchors.margins: Style.space(12)
+              text: "NetBird CLI is not installed or not on PATH."
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              wrapMode: Text.WordWrap
+            }
+          }
+
+          // This device: the address and FQDN NetBird gave us, relay health,
+          // and the same copy menu the peer rows carry.
+          SelfRow {
+            id: selfRow
+            visible: root.showSelf
+            width: parent.width
+          }
+
+          PanelSeparator {
+            visible: netbird.installed && netbird.active
+            foreground: root.foreground
+          }
+
+          Column {
+            visible: netbird.installed && netbird.active
+            width: parent.width
+            spacing: Style.space(10)
+
+            PanelSectionHeader {
+              text: "PEERS"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            Text {
+              visible: netbird.active && netbird.peers.length === 0
+              width: parent.width
+              text: "No peers on this network."
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              horizontalAlignment: Text.AlignHCenter
+            }
+
+            Column {
+              id: peerColumn
+              visible: root.showPeers
+              width: parent.width
+              spacing: Style.space(6)
+
+              Repeater {
+                model: netbird.peers
+                PeerRow {
+                  required property var modelData
+                  required property int index
+                  width: peerColumn.width
+                  peer: modelData
+                  rowIndex: index
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Shared drop-down behind every copy button: the same list-and-choose menu
+  // the Tailscale widget uses, lifted out so the self row and the peer rows
+  // cannot drift apart.
+  component CopyMenu: Popup {
+    id: menu
+    property var options: []
+    property Item anchorButton: null
+    property int index: 0
+    signal chosen(string kind)
+
+    x: anchorButton ? anchorButton.x + anchorButton.width - width : 0
+    y: anchorButton ? anchorButton.y + anchorButton.height + Style.space(4) : 0
+    width: Style.space(280)
+    padding: 0
+    modal: false
+    focus: true
+    closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+
+    function clampIndex() {
+      index = Math.max(0, Math.min(index, options.length - 1))
+    }
+
+    function move(delta) {
+      if (options.length === 0) return
+      index = Math.max(0, Math.min(options.length - 1, index + delta))
+    }
+
+    function chooseCurrent() {
+      clampIndex()
+      if (options.length === 0) return
+      menu.chosen(String(options[index].kind || ""))
+      menu.close()
+    }
+
+    function handleKey(event) {
+      if (event.key === Qt.Key_Escape) {
+        menu.close()
+        event.accepted = true
+        return
+      }
+      if (event.key === Qt.Key_Down || event.text === "j") {
+        menu.move(1)
+        event.accepted = true
+        return
+      }
+      if (event.key === Qt.Key_Up || event.text === "k") {
+        menu.move(-1)
+        event.accepted = true
+        return
+      }
+      if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Space) {
+        menu.chooseCurrent()
+        event.accepted = true
+      }
+    }
+
+    onOpenedChanged: {
+      root.copyMenuOpen = opened
+      if (opened) {
+        menu.clampIndex()
+        Qt.callLater(function() { menuContent.forceActiveFocus() })
+      } else if (root.opened) {
+        Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+      }
+    }
+
+    background: BorderSurface {
+      color: Color.background
+      borderSpec: Border.flat(root.dim, 1)
+      radius: Style.cornerRadius
+    }
+
+    contentItem: Column {
+      id: menuContent
+      width: parent.width
+      focus: true
+      Keys.priority: Keys.BeforeItem
+      Keys.onPressed: function(event) { menu.handleKey(event) }
+
+      Repeater {
+        model: menu.options
+        CopyChoice {
+          required property var modelData
+          required property int index
+          width: parent.width
+          label: String(modelData.label || "")
+          selected: menu.index === index
+          onHovered: menu.index = index
+          onChosen: {
+            menu.chosen(String(modelData.kind || ""))
+            menu.close()
+          }
+        }
+      }
+    }
+  }
+
+  component CopyChoice: CursorSurface {
+    id: copyChoice
+    signal chosen()
+    signal hovered()
+    property string label: ""
+    property bool selected: false
+
+    visible: enabled
+    foreground: root.foreground
+    hasCursor: selected
+    implicitHeight: Style.space(48)
+    radius: 0
+
+    MouseArea {
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onEntered: copyChoice.hovered()
+      onClicked: copyChoice.chosen()
+    }
+
+    RowLayout {
+      anchors.fill: parent
+      anchors.leftMargin: Style.space(12)
+      anchors.rightMargin: Style.space(12)
+      spacing: Style.space(10)
+
+      Text {
+        Layout.fillWidth: true
+        text: copyChoice.label
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.body
+        elide: Text.ElideRight
+      }
+
+      Text {
+        text: "󰆏"
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.icon
+        Layout.alignment: Qt.AlignVCenter
+      }
+    }
+  }
+
+  component SelfRow: CursorSurface {
+    id: selfSurface
+
+    function openCopyMenu() {
+      if (root.selfCopyOptions.length === 0) return
+      selfCopyMenu.open()
+    }
+
+    hasCursor: root.cursorActive && root.focusSection === "self"
+    foreground: root.foreground
+
+    implicitHeight: Math.max(selfContent.implicitHeight, selfCopyButton.implicitHeight) + Style.spacing.rowPaddingX
+
+    MouseArea {
+      anchors.fill: parent
+      acceptedButtons: Qt.LeftButton
+      hoverEnabled: true
+      cursorShape: Qt.ArrowCursor
+      onContainsMouseChanged: if (containsMouse) root.setSelfCursor()
+    }
+
+    RowLayout {
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      anchors.leftMargin: Style.space(10)
+      anchors.rightMargin: Style.space(8)
+      spacing: Style.space(8)
+
+      Text {
+        text: "󰌘"
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.icon
+        Layout.alignment: Qt.AlignVCenter
+      }
+
+      ColumnLayout {
+        id: selfContent
+        Layout.fillWidth: true
+        spacing: Style.space(1)
+
+        Text {
+          Layout.fillWidth: true
+          text: netbird.selfFqdn !== "" ? netbird.selfFqdn : netbird.selfName
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
+          elide: Text.ElideRight
+        }
+
+        Text {
+          Layout.fillWidth: true
+          text: root.selfDetail
+          visible: text !== ""
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          elide: Text.ElideRight
+        }
+      }
+
+      PanelActionButton {
+        id: selfCopyButton
+        iconText: "󰆏"
+        tooltipText: "Copy this device"
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        enabled: root.selfCopyOptions.length > 0
+        Layout.alignment: Qt.AlignVCenter
+        onClicked: selfSurface.openCopyMenu()
+      }
+
+      CopyMenu {
+        id: selfCopyMenu
+        options: root.selfCopyOptions
+        anchorButton: selfCopyButton
+        onChosen: function(kind) {
+          if (kind === "name") netbird.copyToClipboard(netbird.selfName)
+          else if (kind === "fqdn") netbird.copyToClipboard(netbird.selfFqdn)
+          else if (kind === "ip") netbird.copyToClipboard(netbird.selfIp)
+        }
+      }
+    }
+  }
+
+  component PeerRow: CursorSurface {
+    id: peerRow
+    property var peer: null
+    property int rowIndex: 0
+    readonly property string peerName: peer ? String(peer.name || "Unknown") : "Unknown"
+    readonly property string peerIp: peer ? String(peer.ip || "") : ""
+    readonly property string peerFqdn: peer ? String(peer.fqdn || "") : ""
+    readonly property bool peerDimmed: peer ? peer.dimmed === true : true
+    readonly property string peerDetail: {
+      if (!peer) return ""
+      var parts = []
+      if (peerIp !== "") parts.push(peerIp)
+      // The glyph carries the state at a glance; the word spells it out, and
+      // is the marker a Disconnected peer needs to read as genuinely gone.
+      if (peer.online !== true) parts.push(String(peer.status || "unknown").toLowerCase())
+      if (String(peer.connectionType || "") !== "") parts.push(String(peer.connectionType).toLowerCase())
+      if (String(peer.latency || "") !== "") parts.push(String(peer.latency))
+      return parts.join(" · ")
+    }
+    readonly property var copyOptions: {
+      var options = []
+      if (peerName !== "") options.push({ kind: "name", label: peerName })
+      if (peerFqdn !== "") options.push({ kind: "fqdn", label: peerFqdn })
+      if (peerIp !== "") options.push({ kind: "ip", label: peerIp })
+      return options
+    }
+
+    function openCopyMenu() {
+      if (copyOptions.length === 0) return
+      peerCopyMenu.open()
+    }
+
+    hasCursor: root.cursorActive && root.focusSection === "peers" && root.peerIndex === rowIndex
+    foreground: root.foreground
+
+    implicitHeight: Math.max(peerContent.implicitHeight, peerCopyButton.implicitHeight) + Style.spacing.rowPaddingX
+
+    MouseArea {
+      anchors.fill: parent
+      acceptedButtons: Qt.LeftButton
+      hoverEnabled: true
+      cursorShape: Qt.ArrowCursor
+      onContainsMouseChanged: if (containsMouse) root.setPeerCursor(peerRow.rowIndex)
+    }
+
+    RowLayout {
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      anchors.leftMargin: Style.space(10)
+      anchors.rightMargin: Style.space(8)
+      spacing: Style.space(8)
+
+      Text {
+        text: peerRow.peer ? String(peerRow.peer.glyph || "○") : "○"
+        color: peerRow.peerDimmed ? root.dim : root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.icon
+        Layout.alignment: Qt.AlignVCenter
+      }
+
+      ColumnLayout {
+        id: peerContent
+        Layout.fillWidth: true
+        spacing: Style.space(1)
+
+        Text {
+          Layout.fillWidth: true
+          text: peerRow.peerName
+          color: peerRow.peerDimmed ? root.dim : root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
+          elide: Text.ElideRight
+        }
+
+        Text {
+          Layout.fillWidth: true
+          text: peerRow.peerDetail
+          visible: text !== ""
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          elide: Text.ElideRight
+        }
+      }
+
+      PanelActionButton {
+        id: peerCopyButton
+        iconText: "󰆏"
+        tooltipText: "Copy peer details"
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        enabled: peerRow.copyOptions.length > 0
+        Layout.alignment: Qt.AlignVCenter
+        onClicked: peerRow.openCopyMenu()
+      }
+
+      CopyMenu {
+        id: peerCopyMenu
+        options: peerRow.copyOptions
+        anchorButton: peerCopyButton
+        onChosen: function(kind) {
+          if (kind === "name") netbird.copyPeerName(peerRow.peer)
+          else if (kind === "fqdn") netbird.copyPeerFqdn(peerRow.peer)
+          else if (kind === "ip") netbird.copyPeerIp(peerRow.peer)
+        }
+      }
+    }
+  }
+}
