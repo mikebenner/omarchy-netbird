@@ -59,6 +59,7 @@ Settings live inline on the widget's entry in `~/.config/omarchy/shell.json`.
 | Key | Type | Default | Range | What it does |
 |---|---|---|---|---|
 | `refreshIntervalSec` | integer | `30` | 5–3600 | How often `netbird status --json` is polled |
+| `iconStyle` | enum | `theme` | `theme`, `color` | Themed vector mark, or NetBird's own coloured artwork |
 
 ## IPC
 
@@ -153,9 +154,17 @@ operator authorization row.
 
 ## Icon
 
-The bar shows NetBird's own system-tray artwork, one icon per connection
-state — the same coloured set `netbird-ui` puts in the tray. The icon carries
-the state on its own; there is no crossed-out or warning overlay drawn on top.
+The bar shows the NetBird mark, one icon per connection state. Two styles:
+
+- **`theme`** (default): the mark is drawn as vector paths in the colours your
+  Omarchy theme is using — foreground when connected, dimmed when connecting or
+  disconnected, `urgent` on error — and it follows a theme switch live. Being
+  vector, it is crisp at any bar size.
+- **`color`**: NetBird's own coloured tray artwork, exactly what `netbird-ui`
+  shows.
+
+Set it with the `iconStyle` setting above. Either way the icon carries the
+state itself; there is no crossed-out overlay drawn on top.
 
 | Widget state | Icon | When |
 |---|---|---|
@@ -166,14 +175,15 @@ the state on its own; there is no crossed-out or warning overlay drawn on top.
 | needs login | `needs-login` | daemon `NeedsLogin`, `SessionExpired` or `LoginFailed` |
 | not installed | `disconnected`, faded | no `netbird` on `PATH` |
 
-Icons are © NetBird GmbH, BSD-3-Clause, taken unmodified from
-[netbirdio/netbird](https://github.com/netbirdio/netbird) — see
-[`assets/NOTICE`](assets/NOTICE) for the pinned commit, checksums, and licence.
+In `theme` style the badges are drawn to mirror the official artwork: a check
+when connected, three dots while connecting, a cross on error or needs-login,
+nothing when simply disconnected.
 
-There is no theme-tinted monochrome style. One was built and withdrawn: the
-upstream white silhouettes tint correctly under plain `qml6` but draw nothing
-inside quickshell's layer-shell bar, with no error logged. The unused mono
-files still ship so a fix is a code-only change — `assets/NOTICE` lists them.
+Both the vector geometry and the coloured bitmaps are © NetBird GmbH,
+BSD-3-Clause, taken unmodified from
+[netbirdio/netbird](https://github.com/netbirdio/netbird) — see
+[`assets/NOTICE`](assets/NOTICE) for the pinned commit, the exact upstream
+paths, checksums, and licence.
 
 ## Tests
 

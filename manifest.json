@@ -20,7 +20,8 @@
     "allowMultiple": false,
     "defaultSection": "right",
     "defaults": {
-      "refreshIntervalSec": 30
+      "refreshIntervalSec": 30,
+      "iconStyle": "theme"
     },
     "schema": [
       {
@@ -31,6 +32,17 @@
         "max": 3600,
         "step": 5,
         "defaultValue": 30
+      },
+      {
+        "key": "iconStyle",
+        "type": "enum",
+        "label": "Icon style",
+        "options": [
+          "theme",
+          "color"
+        ],
+        "defaultValue": "theme",
+        "description": "theme draws the NetBird mark in your theme's colours and follows a theme switch; color shows NetBird's own coloured tray artwork."
       }
     ]
   }

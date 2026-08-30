@@ -33,6 +33,10 @@ Panel {
   // Only claim the header cursor when the switch is actually on screen —
   // "header" stays navigable, but an absent CLI leaves nothing to highlight.
   readonly property bool headerHasCursor: cursorActive && focusSection === "header" && netbird.installed
+  // "theme" unless the user asked for the official artwork; an unrecognised
+  // value falls back to the themed mark rather than to nothing.
+  readonly property string iconStyle: String(setting("iconStyle", "theme") || "") === "color" ? "color" : "theme"
+  readonly property color barBackground: bar && bar.background ? bar.background : Color.background
 
   // A toggle the daemon has not caught up with yet. `active` is the optimistic
   // value and `running` the observed one, so they disagree exactly while a
@@ -257,6 +261,11 @@ Panel {
           anchors.centerIn: parent
           iconSize: Style.space(11)
           state: root.iconState
+          style: root.iconStyle
+          color: root.barForeground
+          dimColor: Qt.darker(root.barForeground, 1.55)
+          urgentColor: root.urgent
+          outlineColor: root.barBackground
         }
       }
     }
@@ -335,6 +344,11 @@ Panel {
                 NetbirdIcon {
                   iconSize: Style.font.display
                   state: root.iconState
+                  style: root.iconStyle
+                  color: root.foreground
+                  dimColor: root.dim
+                  urgentColor: root.urgent
+                  outlineColor: Color.popups.background
                 }
               }
 
