@@ -198,11 +198,25 @@ function parseStatus(raw, nowMs) {
   var text = String(raw || "").trim()
   if (text === "") return emptyStatus()
 
+  // The document is normally the whole of stdout, but a CLI that prepends a
+  // warning line still gave us a usable status — carve the outermost braces
+  // out and try again before calling it an error.
   var data = null
   try {
     data = JSON.parse(text)
   } catch (e) {
     data = null
+  }
+  if (data === null) {
+    var open = text.indexOf("{")
+    var close = text.lastIndexOf("}")
+    if (open !== -1 && close > open) {
+      try {
+        data = JSON.parse(text.substring(open, close + 1))
+      } catch (e2) {
+        data = null
+      }
+    }
   }
   if (!data || typeof data !== "object" || (typeof data.length === "number" && !data.daemonStatus)) {
     var broken = emptyStatus()
@@ -285,16 +299,60 @@ function parseStatus(raw, nowMs) {
 // The daemon also logs its own management and signal endpoints, so a URL only
 // counts when the surrounding text is actually asking for a browser, and the
 // endpoint URL the caller already knows is skipped.
+// The two sentences `netbird up` prints when it wants a browser, verbatim from
+// the 0.77.1 binary:
+//
+//   Please do the SSO login in your browser.
+//   If your browser didn't open automatically, use this URL to log in:
+//   Use this URL to log in:                      (the --no-browser short form)
+//
+// Nothing weaker counts. An earlier, looser test — any of "login", "browser",
+// "authenticate" anywhere — turned `failed to authenticate TLS peer at
+// https://status.example/error` into a browser launch.
+var SSO_PROMPT = /sso login|use this url to log in/i
+
+// A line that is reporting a failure is never an invitation to click, whatever
+// else it contains.
+var FAILURE_LINE = /\b(error|errors|failed|failure|fatal|warn|warning|cannot|could not|unable)\b/i
+
 function extractAuthUrl(text, excludeUrl) {
   var value = String(text || "")
-  if (!/log ?in|browser|verification|user code|authenticate|authorize/i.test(value)) return ""
-  var urls = value.match(/https?:\/\/\S+/g) || []
-  for (var i = 0; i < urls.length; i++) {
-    var url = urls[i].replace(/[.,;:)\]]+$/, "")
-    if (excludeUrl && url === String(excludeUrl)) continue
-    return url
+  if (!SSO_PROMPT.test(value)) return ""
+
+  var excluded = String(excludeUrl || "")
+  var excludedHost = excluded === "" ? "" : hostFromUrl(excluded)
+  var lines = value.split(/\r?\n/)
+
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i]
+    if (FAILURE_LINE.test(line)) continue
+    var urls = line.match(/https?:\/\/\S+/g) || []
+    for (var j = 0; j < urls.length; j++) {
+      var url = urls[j].replace(/[.,;:)\]]+$/, "")
+      if (excluded !== "" && url === excluded) continue
+      // The management and admin endpoints are printed by the daemon's own
+      // chatter; the identity provider is somewhere else.
+      if (excludedHost !== "" && hostFromUrl(url) === excludedHost) continue
+      return url
+    }
   }
   return ""
+}
+
+// SplitParser hands `netbird up` output over one line at a time, but the
+// prompt and the URL it refers to arrive on different lines — so nothing can
+// be decided from a single line. Accumulate, and re-read the whole buffer
+// after every line. Pure so the line-by-line sequence is unit-testable.
+var LOGIN_BUFFER_LIMIT = 16384
+
+function loginProgress(bufferSoFar, newLine, excludeUrl) {
+  var buffer = String(bufferSoFar === undefined || bufferSoFar === null ? "" : bufferSoFar)
+  var line = String(newLine === undefined || newLine === null ? "" : newLine)
+  buffer = buffer === "" ? line : buffer + "\n" + line
+  // The SSO prompt is a handful of lines; anything past the cap is a daemon
+  // logging into our pipe, and the tail is the part that still matters.
+  if (buffer.length > LOGIN_BUFFER_LIMIT) buffer = buffer.substring(buffer.length - LOGIN_BUFFER_LIMIT)
+  return { buffer: buffer, url: extractAuthUrl(buffer, excludeUrl) }
 }
 
 function upCommand() {
@@ -342,6 +400,7 @@ if (typeof module !== "undefined") {
     peerCountText: peerCountText,
     parseStatus: parseStatus,
     extractAuthUrl: extractAuthUrl,
+    loginProgress: loginProgress,
     upCommand: upCommand,
     downCommand: downCommand,
     statusCommand: statusCommand,

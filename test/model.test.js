@@ -313,6 +313,97 @@ test("formatLatency scales with the size of the number", () => {
   assert.equal(Model.formatLatency(143000000), "143 ms")
 })
 
+// NB-03. SplitParser delivers `netbird up --no-browser` output one line at a
+// time, and no single line of the real prompt carries both the invitation and
+// the URL — the whole point of accumulating.
+test("loginProgress yields the SSO URL exactly once, on the line that completes it", () => {
+  const lines = [
+    "Please do the SSO login in your browser.",
+    "If your browser didn't open automatically, use this URL to log in:",
+    "",
+    "https://idp.example/activate"
+  ]
+  const management = "https://netbird.example:443"
+
+  let buffer = ""
+  const urls = []
+  for (const line of lines) {
+    const progress = Model.loginProgress(buffer, line, management)
+    buffer = progress.buffer
+    urls.push(progress.url)
+  }
+
+  // Nothing to open until the URL itself arrives.
+  assert.deepEqual(urls.slice(0, 3), ["", "", ""])
+  assert.equal(urls[3], "https://idp.example/activate")
+  assert.equal(urls.filter((u) => u !== "").length, 1)
+  // Each line alone yields nothing — the accumulation is what does the work.
+  for (const line of lines) assert.equal(Model.extractAuthUrl(line, management), "")
+  assert.equal(buffer, lines.join("\n"))
+})
+
+test("loginProgress handles the short --no-browser prompt and an empty start", () => {
+  let progress = Model.loginProgress("", "Use this URL to log in:", "")
+  assert.equal(progress.url, "")
+  assert.equal(progress.buffer, "Use this URL to log in:")
+
+  progress = Model.loginProgress(progress.buffer, "https://idp.example/device?user_code=AB-CD", "")
+  assert.equal(progress.url, "https://idp.example/device?user_code=AB-CD")
+
+  // Null and undefined lines are survivable, and the buffer is bounded.
+  assert.equal(Model.loginProgress(null, null, "").buffer, "")
+  assert.equal(Model.loginProgress(undefined, "x", "").buffer, "x")
+  const huge = Model.loginProgress("y".repeat(40000), "tail", "")
+  assert.ok(huge.buffer.length <= 16384)
+  assert.ok(huge.buffer.endsWith("tail"))
+})
+
+// NB-04. An auth-flavoured word in a failure line is not an invitation to
+// click; only the phrasing NetBird actually prints counts.
+test("extractAuthUrl refuses auth-flavoured error lines", () => {
+  assert.equal(Model.extractAuthUrl("failed to authenticate TLS peer at https://status.example/error", ""), "")
+  assert.equal(Model.extractAuthUrl("failed to authenticate TLS peer at https://status.example/error", "https://netbird.example:443"), "")
+  assert.equal(Model.extractAuthUrl("WARN could not log in via https://status.example/x", ""), "")
+  assert.equal(Model.extractAuthUrl("error: SSO login unavailable, see https://status.example/x", ""), "")
+  assert.equal(Model.extractAuthUrl("please authorize this device at https://idp.example/activate", ""), "")
+
+  // The real phrasing still extracts, including when a failure line sits in
+  // the same buffer as a genuine prompt.
+  const mixed = [
+    "WARN relay probe failed for https://relay.example/health",
+    "Please do the SSO login in your browser.",
+    "https://idp.example/activate?user_code=ABCD-EFGH"
+  ].join("\n")
+  assert.equal(Model.extractAuthUrl(mixed, ""), "https://idp.example/activate?user_code=ABCD-EFGH")
+
+  // A URL sharing the management host is the daemon talking about itself.
+  const sameHost = "Please do the SSO login in your browser.\nhttps://netbird.example/peers"
+  assert.equal(Model.extractAuthUrl(sameHost, "https://netbird.example:443"), "")
+})
+
+// NB-05. A CLI that prepends a warning line still handed us a status document.
+test("a warning line before the JSON does not lose the document", () => {
+  const status = Model.parseStatus('WARNING: cache stale\n{"daemonStatus":"Idle"}', NOW)
+  assert.equal(status.ok, true)
+  assert.equal(status.unavailable, false)
+  assert.equal(status.daemonStatus, "Idle")
+  assert.equal(status.statusText, "Disconnected")
+
+  const trailing = Model.parseStatus('warn: x\n{"daemonStatus":"Connected"}\nbye', NOW)
+  assert.equal(trailing.ok, true)
+  assert.equal(trailing.daemonStatus, "Connected")
+
+  const full = Model.parseStatus("WARNING: cache stale\n" + fixture("connected"), NOW)
+  assert.equal(full.ok, true)
+  assert.equal(full.selfIp, "100.64.0.9")
+  assert.equal(full.peers.length, 4)
+
+  // Salvage must not turn genuine garbage into a false success.
+  for (const raw of ["netbird: command not found", "{", "<html>{oops}</html>"]) {
+    assert.equal(Model.parseStatus(raw, NOW).ok, false, `expected ok=false for ${JSON.stringify(raw)}`)
+  }
+})
+
 test("extractAuthUrl only opens a browser for an actual login prompt", () => {
   const prompt = [
     "Please do the SSO login in your browser.",
@@ -327,9 +418,11 @@ test("extractAuthUrl only opens a browser for an actual login prompt", () => {
   assert.equal(Model.extractAuthUrl("failed to connect to https://netbird.example:443: timeout", ""), "")
   // The endpoint the caller already knows is skipped even inside a prompt.
   assert.equal(
-    Model.extractAuthUrl("log in at https://netbird.example:443 then https://idp.netbird.example/device", "https://netbird.example:443"),
+    Model.extractAuthUrl("Use this URL to log in: https://netbird.example:443 then https://idp.netbird.example/device", "https://netbird.example:443"),
     "https://idp.netbird.example/device"
   )
+  // The same sentence without NetBird's actual phrasing is not a prompt at all.
+  assert.equal(Model.extractAuthUrl("log in at https://idp.netbird.example/device", ""), "")
   assert.equal(Model.extractAuthUrl("", ""), "")
 })
 

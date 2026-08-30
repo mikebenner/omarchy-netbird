@@ -62,6 +62,10 @@ Item {
   property string _loginError: ""
   property bool _loginInProgress: false
   property bool _loginUrlOpened: false
+  // Every line `netbird up` has printed so far, stdout and stderr interleaved
+  // in arrival order — the SSO prompt and its URL can land on either stream.
+  property string _loginBuffer: ""
+  property bool _loginCancelled: false
   property bool _watchdogReaped: false
 
   function setting(name, fallback) {
@@ -121,11 +125,10 @@ Item {
     refreshing = true
     statusProcess.command = Model.statusCommand()
     statusProcess.running = true
-    // Arm on the launch that needs watching and leave it alone after that.
-    // Restarting it every refresh pushes the deadline out ahead of a hung
-    // process forever once the refresh interval is shorter than the timeout,
-    // and refreshIntervalSec goes down to five seconds.
-    if (!pollWatchdog.running) pollWatchdog.start()
+    // Armed here and stopped in onExited, so the deadline always measures the
+    // process it would reap. Leaving it armed across a successful poll let an
+    // old deadline expire onto a later, healthy one and kill it early.
+    pollWatchdog.restart()
   }
 
   function elideStatus(text) {
@@ -222,32 +225,68 @@ Item {
     })
   }
 
+  // THE TOGGLE RULE. `up()` and `down()` are the only ways to move the tunnel,
+  // and every caller goes through them — the hero switch, the `t` key, the bar
+  // right-click, and each IPC method. Neither starts while the other's process
+  // is still running: a request that arrives on a busy service is refused and
+  // returns false, leaving `_desired` alone, because a rejected request must
+  // not repaint a switch it did not move. The single exception is `down()`
+  // during a pending login, which cancels the login and proceeds — a user
+  // saying "off" outranks an SSO flow that otherwise blocks for minutes.
   function toggleNetbird() {
-    if (!installed) return
-    if (active) down()
-    else up()
+    if (!installed) return false
+    return active ? down() : up()
   }
 
   function down() {
+    if (!installed) return false
+    // "Off" wins over a login still waiting on a browser.
+    if (loginProcess.running) cancelLogin()
+    if (actionProcess.running) return false
     // No progress status here — the greyed icon and hero line already convey
     // the optimistic off; only surface a message if the command fails.
     _desired = 0
     desiredTimeout.restart()
     runAction(Model.downCommand())
+    return true
   }
 
   function up() {
-    if (!installed || loginProcess.running) return
+    if (!installed || actionProcess.running || loginProcess.running) return false
     _loginOutput = ""
     _loginError = ""
+    _loginBuffer = ""
     _loginUrlOpened = false
-    _loginInProgress = needsLogin
+    // `_loginCancelled` is deliberately not cleared here: it belongs to the
+    // process that was cancelled, and only that process's exit handler may
+    // consume it. Clearing it would make a cancelled login report a failure
+    // the user asked for.
+    //
+    // In progress whatever the last poll said: the session can expire between
+    // polls, so an `up` that turns out to need SSO must still be watched for
+    // the prompt. Same reason the timers below are armed unconditionally.
+    _loginInProgress = true
     _desired = needsLogin ? -1 : 1
     desiredTimeout.restart()
     if (needsLogin) actionStatus = "Starting NetBird login…"
     loginProcess.command = Model.upCommand()
     loginProcess.running = true
-    if (needsLogin) loginTimeoutTimer.restart()
+    loginTimeoutTimer.restart()
+    loginHardTimeout.restart()
+    return true
+  }
+
+  // Tear down a login in flight without letting its exit handler report a
+  // failure the user caused. Used by `down()` and by the hard timeout.
+  function cancelLogin() {
+    if (!loginProcess.running) return
+    _loginCancelled = true
+    loginProcess.running = false
+    _loginInProgress = false
+    _loginUrlOpened = false
+    _loginBuffer = ""
+    loginTimeoutTimer.stop()
+    loginHardTimeout.stop()
   }
 
   function runAction(command, label) {
@@ -259,10 +298,8 @@ Item {
     actionProcess.running = true
   }
 
-  function openAuthUrlFrom(text) {
-    if (_loginUrlOpened) return true
-    var url = Model.extractAuthUrl(text, managementUrl)
-    if (url === "") return false
+  function openAuthUrl(url) {
+    if (_loginUrlOpened || String(url || "") === "") return false
     // Turning on ended up needing browser auth — stop pretending we're up.
     _desired = -1
     _loginUrlOpened = true
@@ -274,11 +311,23 @@ Item {
     return true
   }
 
+  function openAuthUrlFrom(text) {
+    return openAuthUrl(Model.extractAuthUrl(text, managementUrl))
+  }
+
+  // One line at a time is not enough to decide anything: the prompt sentence
+  // and the URL it points at land on different lines. Keep the running buffer
+  // in the model and re-read it after every line.
   function handleLoginOutput(data, isError) {
-    var text = String(data || "")
+    // A cancelled login can still flush a line before the process dies. None
+    // of it may reopen a flow the user just called off.
+    if (_loginCancelled) return
+    var text = String(data === undefined || data === null ? "" : data)
     if (isError) _loginError += text + "\n"
     else _loginOutput += text + "\n"
-    if (!_loginUrlOpened) openAuthUrlFrom(text)
+    var progress = Model.loginProgress(_loginBuffer, text, managementUrl)
+    _loginBuffer = progress.buffer
+    if (!_loginUrlOpened) openAuthUrl(progress.url)
   }
 
   Timer {
@@ -354,16 +403,42 @@ Item {
   }
 
   Timer {
+    // Armed on every `up`. If the CLI has printed a prompt we somehow did not
+    // act on line by line, this is the second look at the whole buffer.
     id: loginTimeoutTimer
     interval: 10000
     repeat: false
     onTriggered: {
       if (!root._loginInProgress || root._loginUrlOpened) return
-      if (!root.openAuthUrlFrom(String(root._loginOutput) + "\n" + String(root._loginError))) {
+      if (!root.openAuthUrlFrom(root._loginBuffer)) {
         root._loginInProgress = false
-        root.actionStatus = "NetBird login link not available yet"
-        actionStatusTimer.restart()
+        // Not an error: an `up` on a still-valid session simply connects and
+        // never prints a link. Only say something once the user was told a
+        // login was starting.
+        if (root.needsLogin) {
+          root.actionStatus = "NetBird login link not available yet"
+          actionStatusTimer.restart()
+        }
       }
+    }
+  }
+
+  Timer {
+    // `netbird up --no-browser` blocks until the SSO round trip finishes, and
+    // a user who closes the browser without authenticating never finishes it.
+    // The process would then sit there holding the toggle gate shut for as
+    // long as the CLI's own patience lasts, swallowing every retry. Give it a
+    // deadline of our own.
+    id: loginHardTimeout
+    interval: 120000
+    repeat: false
+    onTriggered: {
+      if (!loginProcess.running) return
+      root.cancelLogin()
+      root._desired = -1
+      root.actionStatus = "NetBird login timed out"
+      actionStatusTimer.restart()
+      delayedRefresh.restart()
     }
   }
 
@@ -388,6 +463,9 @@ Item {
     stdout: StdioCollector { id: statusStdout; waitForEnd: true; onStreamFinished: root._statusOutput = text }
     stderr: StdioCollector { id: statusStderr; waitForEnd: true; onStreamFinished: root._statusError = text }
     onExited: function(exitCode) {
+      // First, before anything can return: this deadline belongs to the poll
+      // that just ended and must not outlive it.
+      pollWatchdog.stop()
       root.refreshing = false
       if (root._watchdogReaped) {
         // Our own watchdog ended this poll. The daemon has not told us
@@ -398,11 +476,22 @@ Item {
       }
       var stdout = String(statusStdout.text || root._statusOutput || "")
       var stderr = String(statusStderr.text || root._statusError || "")
-      if (exitCode === 0) root.parseStatus(stdout)
-      else {
-        root.resetUnavailable("Disconnected")
-        root.lastError = root.elideStatus(stderr)
+      if (exitCode === 0) {
+        root.parseStatus(stdout)
+        return
       }
+      // A non-zero exit that still printed a whole status document knows more
+      // than "Disconnected" does — a NeedsLogin or degraded daemon can exit
+      // non-zero and say so in stdout. Only fall back when there is no
+      // document to read.
+      var salvaged = Model.parseStatus(stdout, Date.now())
+      if (salvaged.ok && !salvaged.unavailable) {
+        root.parseStatus(stdout)
+        root.lastError = root.elideStatus(stderr)
+        return
+      }
+      root.resetUnavailable("Disconnected")
+      root.lastError = root.elideStatus(stderr)
     }
   }
 
@@ -435,7 +524,15 @@ Item {
     stdout: SplitParser { onRead: function(data) { root.handleLoginOutput(data, false) } }
     stderr: SplitParser { onRead: function(data) { root.handleLoginOutput(data, true) } }
     onExited: function(exitCode) {
-      var combined = String(root._loginOutput || "") + "\n" + String(root._loginError || "")
+      loginHardTimeout.stop()
+      if (root._loginCancelled) {
+        // We ended this one — `down()` or the hard timeout. Its exit code says
+        // nothing about the user's request, so report nothing.
+        root._loginCancelled = false
+        delayedRefresh.restart()
+        return
+      }
+      var combined = String(root._loginBuffer || "")
       var opened = root.openAuthUrlFrom(combined)
       if (exitCode !== 0 && !opened) {
         root._desired = -1

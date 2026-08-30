@@ -207,9 +207,12 @@ Panel {
     function hide(): void { root.close() }
     function toggle(): void { root.toggle() }
     function refresh(): string { netbird.refresh(); return "ok" }
-    function up(): string { netbird.up(); return "ok" }
-    function down(): string { netbird.down(); return "ok" }
-    function toggleNetbird(): string { netbird.toggleNetbird(); return "ok" }
+    // These three are the same gated entry points the switch, the `t` key and
+    // the bar right-click use, so an IPC caller cannot race a command that is
+    // already running. A refused request answers "busy" rather than "ok".
+    function up(): string { return netbird.up() ? "ok" : "busy" }
+    function down(): string { return netbird.down() ? "ok" : "busy" }
+    function toggleNetbird(): string { return netbird.toggleNetbird() ? "ok" : "busy" }
     function status(): string { return netbird.summary() }
   }
 
