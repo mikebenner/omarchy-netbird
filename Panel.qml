@@ -46,8 +46,11 @@ Panel {
     if (!netbird.active) return "NetBird is disconnected"
     // Session first: on a self-hosted management domain the two together
     // outrun the hero's width, and the clock that will drop you off the mesh
-    // is the half worth keeping when one of them has to elide.
+    // is the half worth keeping when one of them has to elide. A degraded
+    // control plane outranks both — it is the reason the bar icon is wearing
+    // a warning badge, and the panel is where that gets explained.
     var parts = []
+    if (netbird.degraded && netbird.degradedText !== "") parts.push(netbird.degradedText)
     if (netbird.sessionText !== "") parts.push(netbird.sessionText)
     if (netbird.managementHost !== "") parts.push(netbird.managementHost)
     return parts.length > 0 ? parts.join(" · ") : "NetBird is connected"

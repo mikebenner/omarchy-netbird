@@ -83,21 +83,40 @@ Connected · laptop · 100.64.0.9 · 1/4 peers · session expires in 1d 6h
 
 This widget is meant to take the place of the `netbird-ui` tray app. Nothing
 here uninstalls it — disable its autostart yourself once you're happy with the
-widget. The autostart entry is a user file, not a packaged one:
+widget.
+
+The autostart entry is a user file, not a packaged one. It is not launched
+directly, though: `systemd-xdg-autostart-generator` turns it into a systemd
+user unit at login, so the desktop file is what to edit and the unit is what
+to stop.
 
 ```bash
-rm ~/.config/autostart/netbird.desktop
+# what the generator made of it
+systemctl --user list-units 'app-netbird*' --all
+#   UNIT                          LOAD   ACTIVE   SUB     DESCRIPTION
+#   app-netbird@autostart.service loaded <active> <state> NetBird
 ```
 
-To keep the file but stop it launching, set `Hidden=true` in it instead:
+Stop autostarting it, by setting `Hidden=true` in the desktop file — the
+generator then skips it at the next login:
 
 ```bash
 sed -i 's/^Hidden=false$/Hidden=true/' ~/.config/autostart/netbird.desktop
 ```
 
-Either way the tray app already running in this session keeps running until
-you close it (`pkill -f netbird-ui`) or log out. The `netbird` daemon and the
-`netbird` CLI are untouched — the widget needs both.
+Removing the file (`rm ~/.config/autostart/netbird.desktop`) works too, but
+`Hidden=true` is reversible.
+
+Either way the tray app already running in this session keeps running. Stop it
+through its unit rather than by signalling the process, so systemd does not
+count it as a crash:
+
+```bash
+systemctl --user stop 'app-netbird@autostart.service'
+```
+
+The `netbird` daemon and the `netbird` CLI are untouched — the widget needs
+both.
 
 ## Requirements
 

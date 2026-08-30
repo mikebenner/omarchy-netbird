@@ -245,9 +245,12 @@ function parseStatus(raw, nowMs) {
   // Every peer is listed, whatever its state: with lazy connections on, a
   // healthy network can show a single Connected peer and a dozen Idle ones,
   // and an online-only list would read as an empty network.
+  // Go marshals an empty peer slice as null, and a duck-typed length check
+  // would walk a string character by character into a list of phantom peers,
+  // so nothing but a real array is iterated.
   var details = peersBlock.details
   var peers = []
-  if (details && typeof details.length === "number") {
+  if (Array.isArray(details)) {
     for (var i = 0; i < details.length; i++) peers.push(peerFromStatus(details[i]))
   }
   peers.sort(function(a, b) {

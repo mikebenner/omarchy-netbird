@@ -229,6 +229,72 @@ test("a status document with no peers block still parses", () => {
   assert.equal(status.degraded, true)
 })
 
+// `netbird status --json` marshals an empty peer slice as null rather than [],
+// which is the shape a freshly-started daemon reports.
+test("a null peers.details parses to zero peers without throwing", () => {
+  for (const raw of ['{"peers":{"details":null}}', '{"peers":{"total":0,"connected":0,"details":null}}']) {
+    const status = Model.parseStatus(raw, NOW)
+    assert.equal(status.ok, true)
+    assert.equal(status.unavailable, false)
+    assert.deepEqual(status.peers, [])
+    assert.equal(status.peersTotal, 0)
+    assert.equal(status.peersConnected, 0)
+    assert.equal(Model.peerCountText(status), "0/0")
+  }
+
+  // The same must hold for the other shapes the field can arrive in.
+  for (const raw of ['{"peers":{"details":{}}}', '{"peers":null}', '{"peers":{"details":"nope"}}']) {
+    const status = Model.parseStatus(raw, NOW)
+    assert.equal(status.ok, true)
+    assert.deepEqual(status.peers, [])
+  }
+})
+
+test("a connected daemon with no session clock leaves the hero line sane", () => {
+  const doc = JSON.parse(fixture("connected"))
+  delete doc.sessionExpiresAt
+  const status = Model.parseStatus(JSON.stringify(doc), NOW)
+
+  assert.equal(status.running, true)
+  assert.equal(status.sessionExpiresAt, "")
+  assert.equal(status.sessionText, "")
+  // Everything the hero line falls back on is still there.
+  assert.equal(status.statusText, "Connected")
+  assert.equal(status.managementHost, "netbird.example")
+  assert.equal(status.selfName, "laptop")
+  assert.equal(Model.peerCountText(status), "1/4")
+  // And the summary drops the session clause rather than trailing a separator.
+  assert.equal(Model.summaryLine(status), "Connected · laptop · 100.64.0.9 · 1/4 peers")
+
+  // A zero session clock is the same case, not a date in year one.
+  const zeroed = Model.parseStatus(JSON.stringify({ ...doc, sessionExpiresAt: "0001-01-01T00:00:00Z" }), NOW)
+  assert.equal(zeroed.sessionText, "")
+})
+
+// Fix 1's hero line leads with this text, so the exact string is the contract.
+test("degraded text is what the panel puts in front of the session clock", () => {
+  const managementDown = Model.parseStatus(fixture("degraded"), NOW)
+  assert.equal(managementDown.degraded, true)
+  assert.equal(managementDown.degradedText, "Management server unreachable")
+  assert.equal(managementDown.sessionText, "session expires in 1d 6h")
+
+  const doc = JSON.parse(fixture("degraded"))
+  doc.management.connected = true
+  doc.signal.connected = false
+  const signalDown = Model.parseStatus(JSON.stringify(doc), NOW)
+  assert.equal(signalDown.degraded, true)
+  assert.equal(signalDown.degradedText, "Signal server unreachable")
+
+  doc.management.connected = false
+  const bothDown = Model.parseStatus(JSON.stringify(doc), NOW)
+  assert.equal(bothDown.degradedText, "Management and signal servers unreachable")
+
+  // A healthy control plane says nothing, so the hero line stays as it was.
+  const healthy = Model.parseStatus(fixture("connected"), NOW)
+  assert.equal(healthy.degraded, false)
+  assert.equal(healthy.degradedText, "")
+})
+
 test("hostFromUrl trims the scheme and the default port", () => {
   assert.equal(Model.hostFromUrl("https://netbird.example:443"), "netbird.example")
   assert.equal(Model.hostFromUrl("https://netbird.example:8443"), "netbird.example:8443")

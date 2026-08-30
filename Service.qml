@@ -48,6 +48,9 @@ Item {
   property string lastError: ""
 
   readonly property int refreshIntervalSec: intSetting("refreshIntervalSec", 30, 5, 3600)
+  // Three poll cadences wide, never under fifteen seconds: long enough that a
+  // slow-but-healthy `netbird status` is never mistaken for a hung one.
+  readonly property int pollTimeoutSec: Math.max(15, refreshIntervalSec * 3)
   readonly property bool busy: whichProcess.running || statusProcess.running || actionProcess.running || loginProcess.running
   readonly property string peerCountText: peersTotal > 0 || running ? String(peersConnected) + "/" + String(peersTotal) : ""
 
@@ -59,6 +62,7 @@ Item {
   property string _loginError: ""
   property bool _loginInProgress: false
   property bool _loginUrlOpened: false
+  property bool _watchdogReaped: false
 
   function setting(name, fallback) {
     var value = settings ? settings[name] : undefined
@@ -192,7 +196,10 @@ Item {
     daemonVersion = parsed.daemonVersion
     degraded = parsed.degraded
     degradedText = parsed.degradedText
-    peers = parsed.peers
+    // A stopped daemon still reports the peer block it last knew about. Holding
+    // on to it would leave the copy keys handing out addresses for a mesh this
+    // machine is no longer on, so the list empties with the tunnel.
+    peers = parsed.running ? parsed.peers : []
     statusText = parsed.statusText
 
     if (running) {
@@ -225,6 +232,7 @@ Item {
     // No progress status here — the greyed icon and hero line already convey
     // the optimistic off; only surface a message if the command fails.
     _desired = 0
+    desiredTimeout.restart()
     runAction(Model.downCommand())
   }
 
@@ -235,6 +243,7 @@ Item {
     _loginUrlOpened = false
     _loginInProgress = needsLogin
     _desired = needsLogin ? -1 : 1
+    desiredTimeout.restart()
     if (needsLogin) actionStatus = "Starting NetBird login…"
     loginProcess.command = Model.upCommand()
     loginProcess.running = true
@@ -308,12 +317,33 @@ Item {
     // Every poll is skipped while its own process is still running, so one that
     // never exits — the CLI can hang on a daemon that is coming and going —
     // silently stops the panel refreshing at all, and it stays stopped. Reap
-    // anything still running well inside the refresh interval so the next tick
-    // starts clean.
+    // anything still running so the next tick starts clean.
+    //
+    // The deadline has to clear the poll cadence, not just be "big": at the
+    // five-second floor a flat 15s watchdog is only three ticks wide and will
+    // eventually axe a healthy `netbird status` that simply took its time.
     id: pollWatchdog
-    interval: 15000
+    interval: root.pollTimeoutSec * 1000
     repeat: false
-    onTriggered: if (statusProcess.running) statusProcess.running = false
+    onTriggered: {
+      if (!statusProcess.running) return
+      // Killing our own poll says nothing about the daemon, so flag the exit
+      // as ours and let onExited leave the last known state standing.
+      root._watchdogReaped = true
+      statusProcess.running = false
+    }
+  }
+
+  Timer {
+    // The optimistic switch is only ever cleared by reality agreeing or by the
+    // command failing. A `netbird up`/`down` that exits 0 without moving the
+    // daemon satisfies neither, and would pin the knob in the wrong position
+    // for the rest of the session. Give the pretence a hard deadline; once it
+    // lapses the switch follows the daemon again, wherever the daemon is.
+    id: desiredTimeout
+    interval: 20000
+    repeat: false
+    onTriggered: root._desired = -1
   }
 
   Timer {
@@ -359,6 +389,13 @@ Item {
     stderr: StdioCollector { id: statusStderr; waitForEnd: true; onStreamFinished: root._statusError = text }
     onExited: function(exitCode) {
       root.refreshing = false
+      if (root._watchdogReaped) {
+        // Our own watchdog ended this poll. The daemon has not told us
+        // anything, so every field keeps the value the last good poll gave it.
+        root._watchdogReaped = false
+        console.warn("netbird status refresh timed out after", root.pollTimeoutSec, "seconds")
+        return
+      }
       var stdout = String(statusStdout.text || root._statusOutput || "")
       var stderr = String(statusStderr.text || root._statusError || "")
       if (exitCode === 0) root.parseStatus(stdout)
