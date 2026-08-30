@@ -26,6 +26,13 @@ Panel {
   property bool copyMenuOpen: false
   property bool searchOpen: false
   property string peerQuery: ""
+  property int networkIndex: 0
+  property bool relaysExpanded: false
+  // Only one peer's detail is open at a time; "" means none.
+  property string expandedPeerId: ""
+  // "3m ago" has to keep meaning that, so the relative label depends on a
+  // value that changes. Ticks only while a detail is actually on screen.
+  property double detailNow: Date.now()
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color urgent: bar ? bar.urgent : Color.urgent
@@ -109,6 +116,10 @@ Panel {
     return parts.join(" · ")
   }
 
+  readonly property bool showNetworks: netbird.installed && netbird.active && !netbird.daemonDown && netbird.networks.length > 0
+  readonly property string networksHeading: "NETWORKS — " + Model.selectedNetworkCount(netbird.networks) + "/" + netbird.networks.length
+  readonly property bool showRelays: netbird.installed && netbird.active && netbird.relays.length > 0
+
   readonly property var visiblePeers: Model.filterPeers(netbird.peers, root.peerQuery)
   readonly property bool filtering: root.peerQuery !== ""
   readonly property string peersHeading: filtering
@@ -149,7 +160,10 @@ Panel {
   function ensureCursor() {
     if (peerIndex < 0) peerIndex = 0
     if (peerIndex >= visiblePeers.length) peerIndex = Math.max(0, visiblePeers.length - 1)
+    if (networkIndex < 0) networkIndex = 0
+    if (networkIndex >= netbird.networks.length) networkIndex = Math.max(0, netbird.networks.length - 1)
     if (focusSection === "self" && !showSelf) focusSection = showPeers ? "peers" : "header"
+    if (focusSection === "networks" && !showNetworks) focusSection = showPeers ? "peers" : "header"
     if (focusSection === "peers" && !showPeers) focusSection = showSelf ? "self" : "header"
   }
 
@@ -164,10 +178,20 @@ Panel {
         }
       } else if (focusSection === "self") {
         if (dy < 0) focusSection = "header"
+        else if (showNetworks) focusSection = "networks"
         else if (showPeers) focusSection = "peers"
+      } else if (focusSection === "networks") {
+        if (dy < 0) {
+          if (networkIndex <= 0) focusSection = showSelf ? "self" : "header"
+          else networkIndex--
+        } else if (networkIndex < netbird.networks.length - 1) {
+          networkIndex++
+        } else if (showPeers) {
+          focusSection = "peers"
+        }
       } else if (focusSection === "peers") {
         if (dy < 0) {
-          if (peerIndex <= 0) focusSection = showSelf ? "self" : "header"
+          if (peerIndex <= 0) focusSection = showNetworks ? "networks" : (showSelf ? "self" : "header")
           else peerIndex--
         } else if (peerIndex < visiblePeers.length - 1) {
           peerIndex++
@@ -182,7 +206,30 @@ Panel {
     ensureCursor()
     if (focusSection === "header") netbird.toggleNetbird()
     else if (focusSection === "self") selfRow.openCopyMenu()
-    else if (focusSection === "peers") openSelectedPeerCopyMenu()
+    else if (focusSection === "networks") toggleFocusedNetwork()
+    // Enter opens the peer's detail rather than the copy menu: the chevron is
+    // what the row now advertises, and c / n / d already copy without a menu.
+    else if (focusSection === "peers") togglePeerDetail(selectedPeer())
+  }
+
+  function toggleFocusedNetwork() {
+    var list = netbird.networks || []
+    if (list.length === 0) return
+    var entry = list[Math.max(0, Math.min(networkIndex, list.length - 1))]
+    if (entry) netbird.toggleNetwork(entry.id)
+  }
+
+  function togglePeerDetail(peer) {
+    if (!peer) return
+    var id = String(peer.id || "")
+    expandedPeerId = expandedPeerId === id ? "" : id
+  }
+
+  function focusNetworks() {
+    if (!showNetworks) return
+    cursorActive = true
+    focusSection = "networks"
+    networkIndex = Math.max(0, Math.min(networkIndex, netbird.networks.length - 1))
   }
 
   function scrollItemIntoView(item) {
@@ -245,10 +292,25 @@ Panel {
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
-  onOpenedChanged: if (opened) {
+  onOpenedChanged: {
+    // The service lists networks only while someone is looking at them.
+    netbird.panelOpen = opened
+    if (!opened) {
+      // Transient view state does not survive a close. Without this the filter
+      // field reappears on the next open, showing over an unfiltered list, and
+      // an expanded peer stays expanded for a mesh that has since changed.
+      searchOpen = false
+      if (peerSearch) peerSearch.text = ""
+      peerQuery = ""
+      peerIndex = 0
+      expandedPeerId = ""
+      relaysExpanded = false
+      return
+    }
     cursorActive = false
     if (panelFlick) panelFlick.contentY = 0
     netbird.refresh()
+    netbird.refreshNetworks()
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
   onPeerIndexChanged: scrollCursorIntoView()
@@ -258,6 +320,14 @@ Panel {
   Service {
     id: netbird
     settings: root.settings
+  }
+
+  Timer {
+    running: root.opened && root.expandedPeerId !== ""
+    interval: 15000
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: root.detailNow = Date.now()
   }
 
   Connections {
@@ -339,6 +409,9 @@ Panel {
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(t) {
         if (t === "/") root.openSearch()
+        // Capital N, because lowercase n already copies the name.
+        else if (t === "N") root.focusNetworks()
+        else if (t === "e" || t === "E") root.relaysExpanded = !root.relaysExpanded
         else if (t === "t" || t === "T") netbird.toggleNetbird()
         else if (t === "r" || t === "R") netbird.refresh()
         else if (t === "c" || t === "C") root.copyIp()
@@ -544,12 +617,107 @@ Panel {
             }
           }
 
+          // Both numbers are in the status document already; a mismatch is a
+          // real support-ticket source and costs one caption to surface.
+          Text {
+            visible: netbird.versionNotice !== ""
+            width: parent.width
+            text: netbird.versionNotice
+            color: root.urgent
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
+          }
+
           // This device: the address and FQDN NetBird gave us, relay health,
           // and the same copy menu the peer rows carry.
           SelfRow {
             id: selfRow
             visible: root.showSelf
             width: parent.width
+          }
+
+          // Which relay is failing, behind the count on the self row. `e`
+          // toggles; collapsed by default because it is usually all fine.
+          Column {
+            visible: root.showRelays && root.relaysExpanded
+            width: parent.width
+            spacing: Style.space(2)
+
+            Repeater {
+              model: netbird.relays
+              Text {
+                required property var modelData
+                width: parent.width
+                leftPadding: Style.space(34)
+                text: (modelData.available ? "● " : "⊘ ") + modelData.uri
+                  + (modelData.error !== "" ? " — " + modelData.error : "")
+                color: modelData.available ? root.dim : root.urgent
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                elide: Text.ElideRight
+              }
+            }
+          }
+
+          PanelSeparator {
+            visible: root.showNetworks
+            foreground: root.foreground
+          }
+
+          Column {
+            visible: root.showNetworks
+            width: parent.width
+            spacing: Style.space(10)
+
+            RowLayout {
+              width: parent.width
+              spacing: Style.space(8)
+
+              PanelSectionHeader {
+                Layout.fillWidth: true
+                text: root.networksHeading
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+              }
+
+              PanelActionButton {
+                iconText: "󰄬"
+                tooltipText: "Select all networks"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                enabled: !netbird.networksBusy
+                Layout.alignment: Qt.AlignVCenter
+                onClicked: netbird.selectAllNetworks()
+              }
+
+              PanelActionButton {
+                iconText: "󰅖"
+                tooltipText: "Deselect all networks"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                enabled: !netbird.networksBusy
+                Layout.alignment: Qt.AlignVCenter
+                onClicked: netbird.deselectAllNetworks()
+              }
+            }
+
+            Column {
+              id: networkColumn
+              width: parent.width
+              spacing: Style.space(6)
+
+              Repeater {
+                model: netbird.networks
+                NetworkRow {
+                  required property var modelData
+                  required property int index
+                  width: networkColumn.width
+                  network: modelData
+                  rowIndex: index
+                }
+              }
+            }
           }
 
           PanelSeparator {
@@ -873,6 +1041,92 @@ Panel {
     }
   }
 
+  component NetworkRow: CursorSurface {
+    id: networkRow
+    property var network: null
+    property int rowIndex: 0
+    readonly property string networkId: network ? String(network.id || "") : ""
+    readonly property bool selected: netbird.networkSelected(networkId)
+    readonly property string detail: Model.networkDetail(network)
+    readonly property int resolvedCount: {
+      if (!network || !network.resolvedIps) return 0
+      return network.resolvedIps.length
+    }
+
+    hasCursor: root.cursorActive && root.focusSection === "networks" && root.networkIndex === rowIndex
+    foreground: root.foreground
+
+    implicitHeight: Math.max(networkContent.implicitHeight, networkSwitch.implicitHeight) + Style.spacing.rowPaddingX
+
+    MouseArea {
+      anchors.fill: parent
+      acceptedButtons: Qt.LeftButton
+      hoverEnabled: true
+      cursorShape: Qt.ArrowCursor
+      onContainsMouseChanged: if (containsMouse) {
+        root.cursorActive = true
+        root.focusSection = "networks"
+        root.networkIndex = networkRow.rowIndex
+      }
+    }
+
+    RowLayout {
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      anchors.leftMargin: Style.space(10)
+      anchors.rightMargin: Style.space(8)
+      spacing: Style.space(8)
+
+      Text {
+        text: "󰛳"
+        color: networkRow.selected ? root.foreground : root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.icon
+        Layout.alignment: Qt.AlignVCenter
+      }
+
+      ColumnLayout {
+        id: networkContent
+        Layout.fillWidth: true
+        spacing: Style.space(1)
+
+        Text {
+          Layout.fillWidth: true
+          text: networkRow.networkId
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
+          elide: Text.ElideRight
+        }
+
+        Text {
+          Layout.fillWidth: true
+          visible: text !== ""
+          text: {
+            var parts = []
+            if (networkRow.detail !== "") parts.push(networkRow.detail)
+            if (networkRow.resolvedCount > 0) parts.push(networkRow.resolvedCount + " resolved")
+            return parts.join(" · ")
+          }
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          elide: Text.ElideRight
+        }
+      }
+
+      ToggleSwitch {
+        id: networkSwitch
+        checked: networkRow.selected
+        busy: netbird.networksBusy
+        foreground: root.foreground
+        Layout.alignment: Qt.AlignVCenter
+        onToggled: netbird.toggleNetwork(networkRow.networkId)
+      }
+    }
+  }
+
   component PeerRow: CursorSurface {
     id: peerRow
     property var peer: null
@@ -880,6 +1134,7 @@ Panel {
     readonly property string peerName: peer ? String(peer.name || "Unknown") : "Unknown"
     readonly property string peerIp: peer ? String(peer.ip || "") : ""
     readonly property string peerFqdn: peer ? String(peer.fqdn || "") : ""
+    readonly property string peerKey: peer ? String(peer.publicKey || "") : ""
     readonly property bool peerDimmed: peer ? peer.dimmed === true : true
     readonly property string peerDetail: {
       if (!peer) return ""
@@ -897,6 +1152,7 @@ Panel {
       if (peerName !== "") options.push({ kind: "name", label: peerName })
       if (peerFqdn !== "") options.push({ kind: "fqdn", label: peerFqdn })
       if (peerIp !== "") options.push({ kind: "ip", label: peerIp })
+      if (peerKey !== "") options.push({ kind: "key", label: peerKey })
       return options
     }
 
@@ -905,10 +1161,32 @@ Panel {
       peerCopyMenu.open()
     }
 
+    readonly property bool expanded: root.expandedPeerId !== "" && peer && root.expandedPeerId === String(peer.id || "")
+    readonly property var detailRows: {
+      if (!peer || !expanded) return []
+      var rows = []
+      var connection = Model.connectionSummary(peer)
+      if (connection !== "") rows.push({ label: "Connection", value: connection })
+      var ice = Model.iceSummary(peer)
+      if (ice !== "") rows.push({ label: "ICE pair", value: ice })
+      var handshake = Model.relativeSince(peer.lastHandshake, root.detailNow)
+      if (handshake !== "") rows.push({ label: "Last handshake", value: handshake })
+      if (String(peer.latency || "") !== "") rows.push({ label: "Latency", value: String(peer.latency) })
+      var received = Model.formatBytes(peer.transferReceived)
+      var sent = Model.formatBytes(peer.transferSent)
+      if (received !== "" || sent !== "") rows.push({ label: "Transfer", value: "↓ " + received + "   ↑ " + sent })
+      var routes = peer.routes || []
+      if (routes.length > 0) rows.push({ label: "Routes", value: routes.join(", ") })
+      if (peer.quantumResistance === true) rows.push({ label: "Rosenpass", value: "enabled" })
+      return rows
+    }
+
     hasCursor: root.cursorActive && root.focusSection === "peers" && root.peerIndex === rowIndex
     foreground: root.foreground
 
-    implicitHeight: Math.max(peerContent.implicitHeight, peerCopyButton.implicitHeight) + Style.spacing.rowPaddingX
+    implicitHeight: Math.max(peerContent.implicitHeight, peerCopyButton.implicitHeight)
+      + Style.spacing.rowPaddingX
+      + (expanded ? peerDetail.implicitHeight + Style.space(8) : 0)
 
     MouseArea {
       anchors.fill: parent
@@ -918,10 +1196,15 @@ Panel {
       onContainsMouseChanged: if (containsMouse) root.setPeerCursor(peerRow.rowIndex)
     }
 
-    RowLayout {
+    Column {
       anchors.left: parent.left
       anchors.right: parent.right
-      anchors.verticalCenter: parent.verticalCenter
+      anchors.top: parent.top
+      anchors.topMargin: Style.spacing.rowPaddingX / 2
+      spacing: Style.space(6)
+
+    RowLayout {
+      width: parent.width
       anchors.leftMargin: Style.space(10)
       anchors.rightMargin: Style.space(8)
       spacing: Style.space(8)
@@ -960,6 +1243,15 @@ Panel {
       }
 
       PanelActionButton {
+        iconText: peerRow.expanded ? "󰅃" : "󰅀"
+        tooltipText: peerRow.expanded ? "Hide details" : "Show details"
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        Layout.alignment: Qt.AlignVCenter
+        onClicked: root.togglePeerDetail(peerRow.peer)
+      }
+
+      PanelActionButton {
         id: peerCopyButton
         iconText: "󰆏"
         tooltipText: "Copy peer details"
@@ -978,8 +1270,47 @@ Panel {
           if (kind === "name") netbird.copyPeerName(peerRow.peer)
           else if (kind === "fqdn") netbird.copyPeerFqdn(peerRow.peer)
           else if (kind === "ip") netbird.copyPeerIp(peerRow.peer)
+          else if (kind === "key") netbird.copyToClipboard(peerRow.peerKey)
         }
       }
+    }
+
+    // The fields the status document already carries and we used to discard —
+    // the answer to "why is this peer relayed?", which is what the panel is
+    // for. Collapsed until asked for, one peer at a time.
+    Column {
+      id: peerDetail
+      visible: peerRow.expanded
+      width: parent.width
+      spacing: Style.space(2)
+
+      Repeater {
+        model: peerRow.detailRows
+        RowLayout {
+          required property var modelData
+          width: peerDetail.width
+          spacing: Style.space(8)
+
+          Text {
+            Layout.preferredWidth: Style.space(96)
+            leftPadding: Style.space(34)
+            text: modelData.label
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          Text {
+            Layout.fillWidth: true
+            text: modelData.value
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            elide: Text.ElideRight
+          }
+        }
+      }
+    }
     }
   }
 }

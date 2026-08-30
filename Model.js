@@ -131,8 +131,92 @@ function peerFromStatus(peer) {
     connectionType: connectionType === "-" ? "" : connectionType,
     latency: formatLatency(raw.latency),
     lastHandshake: isZeroTime(raw.lastWireguardHandshake) ? "" : String(raw.lastWireguardHandshake),
-    relayAddress: String(raw.relayAddress || "")
+    lastStatusUpdate: isZeroTime(raw.lastStatusUpdate) ? "" : String(raw.lastStatusUpdate),
+    relayAddress: String(raw.relayAddress || ""),
+    publicKey: String(raw.publicKey || ""),
+    transferReceived: intOr(raw.transferReceived, 0),
+    transferSent: intOr(raw.transferSent, 0),
+    quantumResistance: raw.quantumResistance === true,
+    iceLocal: String((raw.iceCandidateType || {}).local || ""),
+    iceRemote: String((raw.iceCandidateType || {}).remote || ""),
+    iceLocalEndpoint: String((raw.iceCandidateEndpoint || {}).local || ""),
+    iceRemoteEndpoint: String((raw.iceCandidateEndpoint || {}).remote || ""),
+    routes: Array.isArray(raw.networks) ? raw.networks.map(String) : []
   }
+}
+
+// --- peer detail formatting -------------------------------------------------
+
+// Bytes as the daemon counts them, in the units a person reads. Binary steps,
+// because that is what a WireGuard counter is measuring.
+var BYTE_UNITS = ["B", "KiB", "MiB", "GiB", "TiB"]
+
+function formatBytes(bytes) {
+  // Absent is not the same as zero: a missing counter hides its row, while a
+  // real zero is worth showing as "0 B".
+  if (bytes === undefined || bytes === null || bytes === "") return ""
+  var n = Number(bytes)
+  if (!isFinite(n) || n < 0) return ""
+  if (n < 1024) return Math.round(n) + " B"
+  var unit = 0
+  var value = n
+  while (value >= 1024 && unit < BYTE_UNITS.length - 1) {
+    value = value / 1024
+    unit++
+  }
+  return (value >= 100 ? Math.round(value) : value.toFixed(1)) + " " + BYTE_UNITS[unit]
+}
+
+// "P2P", or "Relayed via <host>" — the answer to the question the panel exists
+// to settle. The relay address is shown as its host, since the scheme and port
+// are the same for every relay in a deployment.
+function connectionSummary(peer) {
+  if (!peer) return ""
+  var kind = String(peer.connectionType || "")
+  if (kind === "") return ""
+  if (kind.toLowerCase() !== "relayed") return kind
+  var relay = hostFromUrl(peer.relayAddress)
+  return relay === "" ? kind : kind + " via " + relay
+}
+
+// The negotiated ICE pair, local first. Endpoints are appended when the daemon
+// knows them, since "host → srflx" alone rarely settles an argument.
+function iceSummary(peer) {
+  if (!peer) return ""
+  var local = String(peer.iceLocal || "")
+  var remote = String(peer.iceRemote || "")
+  if (local === "" && remote === "") return ""
+  var left = local === "" ? "?" : local
+  var right = remote === "" ? "?" : remote
+  var localEnd = String(peer.iceLocalEndpoint || "")
+  var remoteEnd = String(peer.iceRemoteEndpoint || "")
+  if (localEnd !== "") left += " (" + localEnd + ")"
+  if (remoteEnd !== "") right += " (" + remoteEnd + ")"
+  return left + " → " + right
+}
+
+// "3m ago" for a timestamp in the past. Reuses the duration vocabulary so the
+// panel does not grow a second way of saying the same thing.
+function relativeSince(iso, nowMs) {
+  if (isZeroTime(iso)) return ""
+  var at = Date.parse(String(iso))
+  if (!isFinite(at)) return ""
+  var now = isFinite(Number(nowMs)) ? Number(nowMs) : Date.now()
+  var delta = now - at
+  if (delta < 0) return "just now"
+  var span = formatDuration(delta)
+  return span === "" || span === "under a minute" ? "just now" : span + " ago"
+}
+
+// --- version skew -----------------------------------------------------------
+
+// A CLI and daemon that disagree is a real support-ticket source, and both
+// numbers are already in the status document.
+function versionNotice(cliVersion, daemonVersion) {
+  var cli = String(cliVersion || "").trim()
+  var daemon = String(daemonVersion || "").trim()
+  if (cli === "" || daemon === "" || cli === daemon) return ""
+  return "CLI " + cli + " · daemon " + daemon + " — restart the daemon"
 }
 
 // Every consumer reads the same field set whatever happened, so the unknown and
@@ -162,6 +246,7 @@ function emptyStatus() {
     signalError: "",
     relaysTotal: 0,
     relaysAvailable: 0,
+    relays: [],
     peersTotal: 0,
     peersConnected: 0,
     peers: [],
@@ -170,7 +255,8 @@ function emptyStatus() {
     cliVersion: "",
     daemonVersion: "",
     degraded: false,
-    degradedText: ""
+    degradedText: "",
+    versionNotice: ""
   }
 }
 
@@ -357,6 +443,21 @@ function parseStatus(raw, nowMs) {
   var relays = data.relays || {}
   result.relaysTotal = intOr(relays.total, 0)
   result.relaysAvailable = intOr(relays.available, 0)
+  // Which relay failed, and why — we showed only the count before, which said
+  // something was wrong without saying what.
+  var relayDetails = relays.details
+  if (Array.isArray(relayDetails)) {
+    for (var r = 0; r < relayDetails.length; r++) {
+      var entry = relayDetails[r] || {}
+      // The URI is shown as-is: relays are addressed as stun:/turns:/rels:,
+      // and hostFromUrl is built for the http(s) endpoints, not these.
+      result.relays.push({
+        uri: String(entry.uri || ""),
+        available: entry.available === true,
+        error: String(entry.error || "")
+      })
+    }
+  }
 
   var peersBlock = data.peers || {}
   result.peersTotal = intOr(peersBlock.total, 0)
@@ -388,6 +489,7 @@ function parseStatus(raw, nowMs) {
   result.sessionText = sessionExpiryText(result.sessionExpiresAt, nowMs)
   result.cliVersion = String(data.cliVersion || "")
   result.daemonVersion = String(data.daemonVersion || "")
+  result.versionNotice = versionNotice(result.cliVersion, result.daemonVersion)
 
   // A daemon that says Connected while its control plane is not is the one
   // state worth shouting about: the tunnel looks up but nothing new can join.
@@ -615,6 +717,126 @@ function statusCommand() {
   return timeoutPrefix(DAEMON_TIMEOUT_SEC, DAEMON_KILL_GRACE_SEC).concat(["netbird", "status", "--json"])
 }
 
+// --- networks ---------------------------------------------------------------
+
+function networksListCommand() {
+  return timeoutPrefix(DAEMON_TIMEOUT_SEC, DAEMON_KILL_GRACE_SEC).concat(["netbird", "networks", "list"])
+}
+
+// `-a` is not optional for a single row. Upstream: "Default mode is replace,
+// use -a to append to already selected networks" — so selecting a second
+// network without it silently deselects the first, which is precisely the bug
+// a competing plugin shipped.
+function networksSelectCommand(id) {
+  return timeoutPrefix(DAEMON_TIMEOUT_SEC, DAEMON_KILL_GRACE_SEC)
+    .concat(["netbird", "networks", "select", "-a", String(id)])
+}
+
+function networksDeselectCommand(id) {
+  return timeoutPrefix(DAEMON_TIMEOUT_SEC, DAEMON_KILL_GRACE_SEC)
+    .concat(["netbird", "networks", "deselect", String(id)])
+}
+
+// "all" is special-cased upstream ahead of the append flag, so passing -a here
+// would be meaningless — select all deliberately replaces the whole selection.
+function networksSelectAllCommand() {
+  return timeoutPrefix(DAEMON_TIMEOUT_SEC, DAEMON_KILL_GRACE_SEC)
+    .concat(["netbird", "networks", "select", "all"])
+}
+
+function networksDeselectAllCommand() {
+  return timeoutPrefix(DAEMON_TIMEOUT_SEC, DAEMON_KILL_GRACE_SEC)
+    .concat(["netbird", "networks", "deselect", "all"])
+}
+
+// `netbird networks list` has no --json, so this parses the text form pinned to
+// the 0.77.1 printer (client/cmd/networks.go). Two block shapes, both opening
+// on "  - ID:":
+//
+//     - ID: <id>
+//       Network: <cidr>
+//       Status: Selected | Not Selected
+//
+//     - ID: <id>
+//       Domains: a.example, b.example
+//       Status: Not Selected
+//       Resolved IPs:
+//         [a.example]: 1.2.3.4, 5.6.7.8
+//
+// A row is emitted only for a block that actually opened with an ID, so a
+// warning line or a stray header can never become a phantom network the user
+// could click — the failure mode of the other implementation of this feature.
+var NETWORK_ID_LINE = /^\s*-\s*ID:\s*(\S.*?)\s*$/
+var NETWORK_FIELD_LINE = /^\s*(Network|Domains|Status|Resolved IPs):\s*(.*?)\s*$/
+var NETWORK_RESOLVED_LINE = /^\s*\[([^\]]+)\]:\s*(.*?)\s*$/
+
+function splitList(value) {
+  return String(value || "")
+    .split(",")
+    .map(function(part) { return part.trim() })
+    .filter(function(part) { return part !== "" })
+}
+
+function parseNetworksList(raw) {
+  var text = String(raw === undefined || raw === null ? "" : raw)
+  if (text.trim() === "") return []
+
+  var lines = text.split(/\r?\n/)
+  var networks = []
+  var current = null
+
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i]
+
+    var idMatch = line.match(NETWORK_ID_LINE)
+    if (idMatch) {
+      current = {
+        id: idMatch[1],
+        network: "",
+        domains: [],
+        resolvedIps: [],
+        selected: false
+      }
+      networks.push(current)
+      continue
+    }
+    // Anything before the first "- ID:" is a header or chatter, never a row.
+    if (!current) continue
+
+    var resolved = line.match(NETWORK_RESOLVED_LINE)
+    if (resolved) {
+      current.resolvedIps.push({ domain: resolved[1], ips: splitList(resolved[2]) })
+      continue
+    }
+
+    var field = line.match(NETWORK_FIELD_LINE)
+    if (!field) continue
+    var key = field[1]
+    var value = field[2]
+    if (key === "Network") current.network = value
+    else if (key === "Domains") current.domains = splitList(value)
+    else if (key === "Status") current.selected = value === "Selected"
+  }
+
+  return networks
+}
+
+// What the row shows under the name: the route for a network entry, the domain
+// list for a domain entry.
+function networkDetail(network) {
+  if (!network) return ""
+  if (network.network) return String(network.network)
+  var domains = Array.isArray(network.domains) ? network.domains : []
+  return domains.join(", ")
+}
+
+function selectedNetworkCount(networks) {
+  var list = Array.isArray(networks) ? networks : []
+  var total = 0
+  for (var i = 0; i < list.length; i++) if (list[i] && list[i].selected === true) total++
+  return total
+}
+
 // --- daemon reachability ----------------------------------------------------
 
 // `timeout` reports 124 when it fired, and 128+9 = 137 when the KILL after -k
@@ -727,6 +949,19 @@ if (typeof module !== "undefined") {
     backoffDelaySec: backoffDelaySec,
     pollDelaySec: pollDelaySec,
     timeoutPrefix: timeoutPrefix,
+    formatBytes: formatBytes,
+    connectionSummary: connectionSummary,
+    iceSummary: iceSummary,
+    relativeSince: relativeSince,
+    versionNotice: versionNotice,
+    parseNetworksList: parseNetworksList,
+    networkDetail: networkDetail,
+    selectedNetworkCount: selectedNetworkCount,
+    networksListCommand: networksListCommand,
+    networksSelectCommand: networksSelectCommand,
+    networksDeselectCommand: networksDeselectCommand,
+    networksSelectAllCommand: networksSelectAllCommand,
+    networksDeselectAllCommand: networksDeselectAllCommand,
     upCommand: upCommand,
     downCommand: downCommand,
     statusCommand: statusCommand,

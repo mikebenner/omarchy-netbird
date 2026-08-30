@@ -30,6 +30,12 @@ menus. Everything it knows comes from the `netbird` CLI.
   state, and the section header counts what is showing
 - Tells you when the **daemon itself** is not running, instead of showing a
   stale peer list
+- **Networks**: every route the daemon offers, with a switch per row and
+  select/deselect-all in the header
+- **Per-peer detail**: why a peer is relayed — transport and relay, the
+  negotiated ICE pair, last handshake, transfer, latency, advertised routes
+- Expandable **relay list** behind the relay count, showing which one failed
+- A notice when the CLI and daemon versions disagree
 
 ## Requirements
 
@@ -127,6 +133,9 @@ Inside the panel:
 - `d`: copy the selected row's FQDN
 - `/`: filter the peer list; type to narrow, `enter` or `↓` to move into the
   results, `esc` to clear and close
+- `enter` on a peer row: show or hide that peer's detail
+- `N`: jump to the NETWORKS section (`space`/`enter` toggles the focused row)
+- `e`: show or hide the relay list
 - `t`: toggle NetBird
 - `r`: refresh status
 - `esc`: close the filter if it is open, else cancel a sign-in in progress,
@@ -205,6 +214,25 @@ BSD-3-Clause, taken unmodified from
 [`assets/NOTICE`](assets/NOTICE) for the pinned commit, the exact upstream
 paths, checksums, and licence.
 
+## Networks
+
+Every route the daemon offers appears under **NETWORKS**, one switch per row,
+with the selected count in the header and select-all / deselect-all beside it.
+A row shows its route (`10.0.0.0/16`) or its domains, plus how many addresses
+those domains resolved to.
+
+Toggling one row uses `netbird networks select -a <id>`. The `-a` matters:
+upstream's `select` **replaces** the whole selection by default, so selecting a
+second network without it would silently deselect the first. The header's
+select-all deliberately omits it, because `select all` is special-cased
+upstream to mean "accept everything, including new networks".
+
+NetBird has no separate exit-node concept — a default route is simply a network
+whose range is `0.0.0.0/0`.
+
+The section is hidden when the daemon reports no networks, and the list is only
+read while the panel is open.
+
 ## When the daemon is not running
 
 `netbird status` does not fail when the daemon is stopped — it retries the
@@ -231,6 +259,10 @@ Two deliberate edges in the parsing, both chosen over guessing:
   endpoint compares ASCII hostnames. There is no IDNA canonicalisation, so an
   internationalised management URL and its punycode spelling
   (`bücher.example` vs `xn--bcher-kva.example`) do not compare equal.
+- `netbird networks list` has no `--json`, so its output is parsed as text
+  against the format NetBird 0.77.1 prints. A future release that changes that
+  wording would show an empty NETWORKS section rather than wrong rows: a block
+  is only accepted when it opens with an `- ID:` line.
 - When `netbird status --json` prefixes its document with chatter, the
   recovery sweep tries at most 32 candidate object starts. Brace-bearing prose
   (`WARNING grpc target {Addr:"/run/netbird.sock"}`) is skipped without

@@ -1,0 +1,13 @@
+Available Networks:
+
+  - ID: saas-apps
+    Domains: app.example, api.example
+    Status: Selected
+    Resolved IPs:
+      [app.example]: 203.0.113.10, 203.0.113.11
+      [api.example]: 203.0.113.20
+
+  - ID: partner-domains
+    Domains: partner.example
+    Status: Not Selected
+    Resolved IPs: -

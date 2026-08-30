@@ -887,6 +887,169 @@ test("filterPeers survives malformed peers", () => {
   assert.deepEqual(Model.filterPeers([{ name: "A", ip: "1.2.3.4" }], "a 1.2.3.4").length, 1)
 })
 
+// --- networks ---------------------------------------------------------------
+
+function textFixture(name) {
+  return fs.readFileSync(path.join(FIXTURES, name + ".txt"), "utf8")
+}
+
+// The fixtures reproduce the 0.77.1 printer in client/cmd/networks.go:
+//   "\n  - ID: %s\n    Network: %s\n    Status: %s\n"        (network route)
+//   "\n  - ID: %s\n    Domains: %s\n    Status: %s\n"        (domain route)
+test("parseNetworksList reads network routes and their selection", () => {
+  const networks = Model.parseNetworksList(textFixture("networks-mixed"))
+
+  assert.equal(networks.length, 3)
+  assert.deepEqual(networks.map((n) => n.id), ["office-lan", "datacentre", "full-tunnel"])
+  assert.deepEqual(networks.map((n) => n.selected), [true, false, false])
+  assert.equal(networks[0].network, "10.10.0.0/16")
+  // A default route is just a network whose range is 0.0.0.0/0 — NetBird has
+  // no separate exit-node concept.
+  assert.equal(networks[2].network, "0.0.0.0/0")
+  assert.deepEqual(networks[0].domains, [])
+  assert.equal(Model.selectedNetworkCount(networks), 1)
+  assert.equal(Model.networkDetail(networks[0]), "10.10.0.0/16")
+})
+
+test("parseNetworksList reads domain routes and their resolved addresses", () => {
+  const networks = Model.parseNetworksList(textFixture("networks-domains"))
+
+  assert.equal(networks.length, 2)
+  assert.deepEqual(networks[0].domains, ["app.example", "api.example"])
+  assert.equal(networks[0].selected, true)
+  assert.equal(networks[0].network, "")
+  assert.deepEqual(networks[0].resolvedIps, [
+    { domain: "app.example", ips: ["203.0.113.10", "203.0.113.11"] },
+    { domain: "api.example", ips: ["203.0.113.20"] }
+  ])
+  // "Resolved IPs: -" means none, not a resolution to the string "-".
+  assert.deepEqual(networks[1].resolvedIps, [])
+  assert.equal(Model.networkDetail(networks[0]), "app.example, api.example")
+})
+
+test("parseNetworksList yields nothing rather than phantom rows", () => {
+  assert.deepEqual(Model.parseNetworksList(textFixture("networks-empty")), [])
+  for (const raw of ["", "   ", null, undefined, "WARNING failed to open log file\nrandom\n"]) {
+    assert.deepEqual(Model.parseNetworksList(raw), [])
+  }
+  // Header and stray lines before any "- ID:" can never become a row — the
+  // failure mode of the other implementation of this feature.
+  const noisy = "WARNING grpc chatter\nAvailable Networks:\nNetwork: 10.0.0.0/8\nStatus: Selected\n"
+  assert.deepEqual(Model.parseNetworksList(noisy), [])
+  // A field arriving before its ID belongs to nothing.
+  const ordered = "Available Networks:\n\n  - ID: real\n    Network: 10.0.0.0/8\n    Status: Selected\n"
+  assert.deepEqual(Model.parseNetworksList(ordered).map((n) => n.id), ["real"])
+  assert.equal(Model.selectedNetworkCount(null), 0)
+  assert.equal(Model.networkDetail(null), "")
+})
+
+// `-a` is the whole point: upstream's select replaces by default, so a
+// single-row toggle without it silently deselects everything else.
+test("network commands carry the append flag exactly where they must", () => {
+  assert.deepEqual(Model.networksListCommand(), ["timeout", "-k", "2", "8", "netbird", "networks", "list"])
+  assert.deepEqual(Model.networksSelectCommand("x"), ["timeout", "-k", "2", "8", "netbird", "networks", "select", "-a", "x"])
+  assert.deepEqual(Model.networksDeselectCommand("x"), ["timeout", "-k", "2", "8", "netbird", "networks", "deselect", "x"])
+  // "all" is special-cased upstream ahead of the flag, so -a would be noise.
+  assert.deepEqual(Model.networksSelectAllCommand(), ["timeout", "-k", "2", "8", "netbird", "networks", "select", "all"])
+  assert.deepEqual(Model.networksDeselectAllCommand(), ["timeout", "-k", "2", "8", "netbird", "networks", "deselect", "all"])
+  assert.equal(Model.networksSelectCommand("x").indexOf("-a") !== -1, true)
+  assert.equal(Model.networksSelectAllCommand().indexOf("-a"), -1)
+  assert.equal(Model.networksDeselectCommand("x").indexOf("-a"), -1)
+  // Ids are stringified, never interpolated into a shell string.
+  assert.deepEqual(Model.networksSelectCommand(42).slice(-2), ["-a", "42"])
+})
+
+// --- peer detail ------------------------------------------------------------
+
+test("formatBytes uses binary steps and stays readable", () => {
+  assert.equal(Model.formatBytes(0), "0 B")
+  assert.equal(Model.formatBytes(512), "512 B")
+  assert.equal(Model.formatBytes(1024), "1.0 KiB")
+  assert.equal(Model.formatBytes(1536), "1.5 KiB")
+  assert.equal(Model.formatBytes(1048576), "1.0 MiB")
+  // Past three digits the decimal is noise.
+  assert.equal(Model.formatBytes(187000000), "178 MiB")
+  assert.equal(Model.formatBytes(5e12), "4.5 TiB")
+  for (const bad of [-1, "x", undefined, null, NaN]) assert.equal(Model.formatBytes(bad), "")
+})
+
+test("connectionSummary names the relay a relayed peer is using", () => {
+  assert.equal(Model.connectionSummary({ connectionType: "P2P" }), "P2P")
+  assert.equal(
+    Model.connectionSummary({ connectionType: "Relayed", relayAddress: "rels://relay.netbird.example:443" }),
+    "Relayed via relay.netbird.example"
+  )
+  // Relayed with no address still says relayed rather than inventing a host.
+  assert.equal(Model.connectionSummary({ connectionType: "Relayed", relayAddress: "" }), "Relayed")
+  assert.equal(Model.connectionSummary({ connectionType: "" }), "")
+  assert.equal(Model.connectionSummary(null), "")
+})
+
+test("iceSummary shows the negotiated pair, local first", () => {
+  assert.equal(Model.iceSummary({ iceLocal: "host", iceRemote: "srflx" }), "host → srflx")
+  assert.equal(
+    Model.iceSummary({ iceLocal: "host", iceRemote: "srflx", iceLocalEndpoint: "10.0.0.2:51820", iceRemoteEndpoint: "203.0.113.5:51820" }),
+    "host (10.0.0.2:51820) → srflx (203.0.113.5:51820)"
+  )
+  // A half-known pair is still worth showing.
+  assert.equal(Model.iceSummary({ iceLocal: "host", iceRemote: "" }), "host → ?")
+  assert.equal(Model.iceSummary({ iceLocal: "", iceRemote: "" }), "")
+  assert.equal(Model.iceSummary(null), "")
+})
+
+test("relativeSince turns a timestamp into how long ago it was", () => {
+  const at = "2026-08-30T00:00:00Z"
+  const t = Date.parse(at)
+  assert.equal(Model.relativeSince(at, t + 3 * 60 * 1000), "3m ago")
+  assert.equal(Model.relativeSince(at, t + (2 * 3600 + 5 * 60) * 1000), "2h 5m ago")
+  assert.equal(Model.relativeSince(at, t + 30 * 3600 * 1000), "1d 6h ago")
+  // Sub-minute and clock skew both read as now rather than as nonsense.
+  assert.equal(Model.relativeSince(at, t + 5000), "just now")
+  assert.equal(Model.relativeSince(at, t - 60000), "just now")
+  assert.equal(Model.relativeSince("", t), "")
+  assert.equal(Model.relativeSince("0001-01-01T00:00:00Z", t), "")
+  assert.equal(Model.relativeSince("not a date", t), "")
+})
+
+test("versionNotice fires only on a genuine mismatch", () => {
+  assert.equal(Model.versionNotice("0.77.1", "0.76.0"), "CLI 0.77.1 · daemon 0.76.0 — restart the daemon")
+  assert.equal(Model.versionNotice("0.77.1", "0.77.1"), "")
+  // A missing half is not a mismatch worth shouting about.
+  assert.equal(Model.versionNotice("0.77.1", ""), "")
+  assert.equal(Model.versionNotice("", "0.77.1"), "")
+  assert.equal(Model.versionNotice(null, undefined), "")
+  assert.equal(Model.versionNotice(" 0.77.1 ", "0.77.1"), "")
+})
+
+test("peers carry the detail fields the expander shows", () => {
+  const status = Model.parseStatus(fixture("connected"), NOW)
+  const atlas = status.peers.find((p) => p.name === "atlas")
+
+  assert.equal(atlas.publicKey, "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789ABCDEF2=")
+  assert.equal(atlas.transferReceived, 91234)
+  assert.equal(atlas.transferSent, 47810)
+  assert.deepEqual(atlas.routes, [])
+  assert.equal(atlas.iceLocal, "")
+  assert.equal(Model.connectionSummary(atlas), "P2P")
+  // Absent sub-objects must not throw on the way to empty strings.
+  const bare = Model.peerFromStatus({ fqdn: "x.netbird.example", status: "Idle" })
+  assert.equal(bare.iceLocal, "")
+  assert.equal(bare.transferReceived, 0)
+  assert.deepEqual(bare.routes, [])
+})
+
+test("relay details are parsed for the expandable relay list", () => {
+  const status = Model.parseStatus(fixture("connected"), NOW)
+
+  assert.equal(status.relays.length, 2)
+  assert.equal(status.relays[0].uri, "stun:netbird.example:3478")
+  assert.equal(status.relays[0].available, true)
+  assert.equal(status.relays[0].error, "")
+  // A document with no relay details yields an empty list, not undefined.
+  assert.deepEqual(Model.parseStatus('{"daemonStatus":"Connected","relays":{"total":0,"available":0}}', NOW).relays, [])
+  assert.deepEqual(Model.parseStatus('{"daemonStatus":"Connected","relays":{"details":"nope"}}', NOW).relays, [])
+})
+
 test("commands are the exact argv vectors the service runs", () => {
   // Every daemon call is timeout-wrapped: with the socket gone the CLI retries
   // forever rather than exiting, so without this a poll simply never returns.
@@ -915,8 +1078,34 @@ test("summaryLine is what the status IPC call answers with", () => {
 // than blocklisting this machine's identifiers, every host and address in
 // them is required to be in the documentation domain and the CGNAT range
 // NetBird itself hands out (100.64.0.0/10).
+// Route fixtures describe LANs and domain routes, so their addresses are
+// deliberately RFC 5737 / RFC 1918 / 0.0.0.0/0 rather than CGNAT. They get
+// their own rule; the status documents keep the stricter one.
+test("text fixtures use only documentation ranges and example domains", () => {
+  const names = fs.readdirSync(FIXTURES).filter((n) => n.endsWith(".txt"))
+  assert.ok(names.length >= 3)
+
+  for (const name of names) {
+    const body = fs.readFileSync(path.join(FIXTURES, name), "utf8")
+
+    for (const match of body.match(/\b\d{1,3}(\.\d{1,3}){3}\b/g) || []) {
+      const o = match.split(".").map(Number)
+      const documentation = o[0] === 203 && o[1] === 0 && o[2] === 113
+      const privateNet = o[0] === 10 || (o[0] === 192 && o[1] === 168) || (o[0] === 172 && o[1] >= 16 && o[1] <= 31)
+      const unspecified = match === "0.0.0.0"
+      assert.ok(documentation || privateNet || unspecified, `${name}: ${match} is not a documentation or private address`)
+    }
+
+    for (const match of body.match(/\b[a-z0-9-]+(\.[a-z0-9-]+)+\b/gi) || []) {
+      // Skip anything that is actually a dotted address or a CIDR fragment.
+      if (/^\d/.test(match)) continue
+      assert.ok(/\.example$/.test(match), `${name}: host ${match} is not under .example`)
+    }
+  }
+})
+
 test("fixtures use only synthetic hosts and CGNAT addresses", () => {
-  const names = fs.readdirSync(FIXTURES)
+  const names = fs.readdirSync(FIXTURES).filter((n) => n.endsWith(".json"))
   assert.ok(names.length > 0)
 
   for (const name of names) {

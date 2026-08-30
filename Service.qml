@@ -49,6 +49,22 @@ Item {
   property string daemonDownReason: ""
   // The device code from an SSO login in flight, shown until the login ends.
   property string loginCode: ""
+  property var relays: []
+  property string versionNotice: ""
+
+  // Networks are listed only while the panel is open — the list costs a process
+  // and nobody is looking at it otherwise.
+  property var networks: []
+  property bool networksLoaded: false
+  property bool panelOpen: false
+  // Rows the user has just flipped, before the daemon has confirmed. Keyed by
+  // network id, same optimistic contract as the tunnel toggle, same deadline.
+  property var networkDesired: ({})
+  // A list read that started before the most recent mutation is stale by the
+  // time it lands: the daemon answered about a selection we have already
+  // changed. Bump on every write, capture on every read, discard on mismatch.
+  property int _networkWriteSeq: 0
+  property int _networkReadSeq: 0
   // True for the whole life of `netbird up`. `_loginInProgress` is cleared the
   // moment the browser opens, so it cannot be what a Cancel affordance is
   // gated on: a URL-only login would leave the process running with no way to
@@ -65,6 +81,7 @@ Item {
   // slow-but-healthy `netbird status` is never mistaken for a hung one.
   readonly property int pollTimeoutSec: Math.max(15, refreshIntervalSec * 3)
   readonly property bool busy: whichProcess.running || statusProcess.running || actionProcess.running || loginProcess.running
+  readonly property bool networksBusy: networksProcess.running || networkActionProcess.running
   // While the daemon is missing there is nothing to poll for; back off instead
   // of starting a process every few seconds inside the shared shell process.
   readonly property int pollIntervalSec: Model.pollDelaySec(daemonDown, refreshIntervalSec, _consecutiveDaemonFailures)
@@ -140,6 +157,68 @@ Item {
     pollWatchdog.restart()
   }
 
+  // --- networks -------------------------------------------------------------
+
+  function refreshNetworks() {
+    if (!installed || daemonDown || !running) return false
+    if (!panelOpen || networksProcess.running) return false
+    _networkReadSeq = _networkWriteSeq
+    networksProcess.command = Model.networksListCommand()
+    networksProcess.running = true
+    return true
+  }
+
+  function networkSelected(id) {
+    var key = String(id || "")
+    var pending = networkDesired[key]
+    if (pending !== undefined) return pending === true
+    var list = networks || []
+    for (var i = 0; i < list.length; i++) {
+      if (list[i] && String(list[i].id) === key) return list[i].selected === true
+    }
+    return false
+  }
+
+  function _setNetworkDesired(id, value) {
+    // Reassign rather than mutate: QML only sees a var property change when the
+    // reference changes, so an in-place write would not repaint the row.
+    var next = {}
+    for (var key in networkDesired) next[key] = networkDesired[key]
+    if (value === null) delete next[String(id)]
+    else next[String(id)] = value
+    networkDesired = next
+  }
+
+  function _runNetworkAction(command) {
+    if (!installed || daemonDown || networkActionProcess.running) return false
+    _networkWriteSeq += 1
+    networkActionProcess.command = command
+    networkActionProcess.running = true
+    networkDesiredTimeout.restart()
+    return true
+  }
+
+  function toggleNetwork(id) {
+    var key = String(id || "")
+    if (key === "") return false
+    var want = !networkSelected(key)
+    if (!_runNetworkAction(want ? Model.networksSelectCommand(key) : Model.networksDeselectCommand(key))) return false
+    _setNetworkDesired(key, want)
+    return true
+  }
+
+  function selectAllNetworks() {
+    if (!_runNetworkAction(Model.networksSelectAllCommand())) return false
+    networkDesired = {}
+    return true
+  }
+
+  function deselectAllNetworks() {
+    if (!_runNetworkAction(Model.networksDeselectAllCommand())) return false
+    networkDesired = {}
+    return true
+  }
+
   function elideStatus(text) {
     var value = String(text || "").replace(/\s+/g, " ").trim()
     return value.length > 140 ? value.substring(0, 137) + "…" : value
@@ -180,6 +259,10 @@ Item {
     signalConnected = false
     relaysTotal = 0
     relaysAvailable = 0
+    relays = []
+    versionNotice = ""
+    networks = []
+    networksLoaded = false
     peersTotal = 0
     peersConnected = 0
     sessionExpiresAt = ""
@@ -218,6 +301,8 @@ Item {
     signalConnected = parsed.signalConnected
     relaysTotal = parsed.relaysTotal
     relaysAvailable = parsed.relaysAvailable
+    relays = parsed.relays
+    versionNotice = parsed.versionNotice
     peersTotal = parsed.peersTotal
     peersConnected = parsed.peersConnected
     sessionExpiresAt = parsed.sessionExpiresAt
@@ -556,6 +641,60 @@ Item {
       // is as likely to be on stdout as on stderr.
       root.lastError = root.elideStatus(stderr || stdout)
     }
+  }
+
+  Process {
+    id: networksProcess
+    running: false
+    command: []
+    stdout: BoundedCollector { id: networksStdout; limit: 65536 }
+    stderr: BoundedCollector { id: networksStderr; limit: 16384 }
+    onExited: function(exitCode) {
+      // Discard a read that started before the most recent write: it describes
+      // a selection the user has already changed, and applying it would flip
+      // the row back under them.
+      if (root._networkReadSeq !== root._networkWriteSeq) return
+      if (exitCode !== 0) return
+      root.networks = Model.parseNetworksList(String(networksStdout.tail || ""))
+      root.networksLoaded = true
+      root.networkDesired = {}
+    }
+  }
+
+  Process {
+    id: networkActionProcess
+    running: false
+    command: []
+    stdout: BoundedCollector { id: networkActionStdout; limit: 16384 }
+    stderr: BoundedCollector { id: networkActionStderr; limit: 16384 }
+    onExited: function(exitCode) {
+      if (exitCode !== 0) {
+        root.networkDesired = {}
+        root.lastError = root.elideStatus(
+          String(networkActionStderr.tail || "") || String(networkActionStdout.tail || "") || "netbird networks command failed")
+        root.actionStatus = root.lastError
+        actionStatusTimer.restart()
+      }
+      // Re-read either way: on success to see it, on failure to see the truth.
+      networksRefreshDelay.restart()
+    }
+  }
+
+  Timer {
+    id: networksRefreshDelay
+    interval: 400
+    repeat: false
+    onTriggered: root.refreshNetworks()
+  }
+
+  Timer {
+    // Same contract as the tunnel toggle: an optimistic row cannot outlive the
+    // daemon's silence, or a command that exits 0 without changing anything
+    // would pin the switch.
+    id: networkDesiredTimeout
+    interval: 20000
+    repeat: false
+    onTriggered: root.networkDesired = {}
   }
 
   Process {
