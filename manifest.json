@@ -21,7 +21,8 @@
     "defaultSection": "right",
     "defaults": {
       "refreshIntervalSec": 30,
-      "iconStyle": "theme"
+      "iconStyle": "theme",
+      "adminConsoleUrl": ""
     },
     "schema": [
       {
@@ -43,6 +44,13 @@
         ],
         "defaultValue": "theme",
         "description": "theme draws the NetBird mark in your theme's colours and follows a theme switch; color shows NetBird's own coloured tray artwork."
+      },
+      {
+        "key": "adminConsoleUrl",
+        "type": "string",
+        "label": "Admin console URL",
+        "defaultValue": "",
+        "description": "Where the admin console lives. Left empty it is derived from the management URL, which is right for most self-hosted deployments; set it explicitly for NetBird Cloud (https://app.netbird.io) or a split dashboard host."
       }
     ]
   }

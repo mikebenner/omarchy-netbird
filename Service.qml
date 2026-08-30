@@ -63,8 +63,14 @@ Item {
   // A list read that started before the most recent mutation is stale by the
   // time it lands: the daemon answered about a selection we have already
   // changed. Bump on every write, capture on every read, discard on mismatch.
-  property int _networkWriteSeq: 0
+  // Reads are ordered against writes that have COMPLETED, and never started
+  // while one is in flight. Counting writes *started* let a read that began
+  // mid-write match on the way out and apply a pre-write snapshot.
+  property int _networkWritesCompleted: 0
   property int _networkReadSeq: 0
+
+  property var profiles: []
+  property bool profilesLoaded: false
   // True for the whole life of `netbird up`. `_loginInProgress` is cleared the
   // moment the browser opens, so it cannot be what a Cancel affordance is
   // gated on: a URL-only login would leave the process running with no way to
@@ -82,6 +88,8 @@ Item {
   readonly property int pollTimeoutSec: Math.max(15, refreshIntervalSec * 3)
   readonly property bool busy: whichProcess.running || statusProcess.running || actionProcess.running || loginProcess.running
   readonly property bool networksBusy: networksProcess.running || networkActionProcess.running
+  readonly property bool profilesBusy: profilesProcess.running || profileActionProcess.running
+  readonly property string adminUrl: Model.adminConsoleUrl(managementUrl, setting("adminConsoleUrl", ""))
   // While the daemon is missing there is nothing to poll for; back off instead
   // of starting a process every few seconds inside the shared shell process.
   readonly property int pollIntervalSec: Model.pollDelaySec(daemonDown, refreshIntervalSec, _consecutiveDaemonFailures)
@@ -149,6 +157,8 @@ Item {
   function refreshStatus() {
     if (!installed || statusProcess.running) return
     refreshing = true
+    statusStdout.reset()
+    statusStderr.reset()
     statusProcess.command = Model.statusCommand()
     statusProcess.running = true
     // Armed here and stopped in onExited, so the deadline always measures the
@@ -160,9 +170,13 @@ Item {
   // --- networks -------------------------------------------------------------
 
   function refreshNetworks() {
-    if (!installed || daemonDown || !running) return false
-    if (!panelOpen || networksProcess.running) return false
-    _networkReadSeq = _networkWriteSeq
+    if (!installed || daemonDown || !running || !panelOpen) return false
+    // Never read across a write. The action's own exit schedules the re-read,
+    // so nothing is lost by refusing here.
+    if (!Model.canStartNetworksRead(networkActionProcess.running, networksProcess.running)) return false
+    _networkReadSeq = _networkWritesCompleted
+    networksStdout.reset()
+    networksStderr.reset()
     networksProcess.command = Model.networksListCommand()
     networksProcess.running = true
     return true
@@ -191,7 +205,8 @@ Item {
 
   function _runNetworkAction(command) {
     if (!installed || daemonDown || networkActionProcess.running) return false
-    _networkWriteSeq += 1
+    networkActionStdout.reset()
+    networkActionStderr.reset()
     networkActionProcess.command = command
     networkActionProcess.running = true
     networkDesiredTimeout.restart()
@@ -216,6 +231,56 @@ Item {
   function deselectAllNetworks() {
     if (!_runNetworkAction(Model.networksDeselectAllCommand())) return false
     networkDesired = {}
+    return true
+  }
+
+  // --- profiles -------------------------------------------------------------
+
+  function refreshProfiles() {
+    if (!installed || daemonDown || !panelOpen || profilesProcess.running) return false
+    profilesStdout.reset()
+    profilesStderr.reset()
+    profilesProcess.command = Model.profileListCommand()
+    profilesProcess.running = true
+    return true
+  }
+
+  function activeProfile() {
+    var list = profiles || []
+    for (var i = 0; i < list.length; i++) if (list[i] && list[i].active === true) return String(list[i].name)
+    return ""
+  }
+
+  function selectProfile(name) {
+    var target = String(name || "")
+    if (target === "" || target === activeProfile()) return false
+    if (!installed || daemonDown || profileActionProcess.running || actionProcess.running || loginProcess.running) return false
+    actionStatus = "Switching to profile " + target + "…"
+    profileActionStdout.reset()
+    profileActionStderr.reset()
+    profileActionProcess.command = Model.profileSelectCommand(target)
+    profileActionProcess.running = true
+    return true
+  }
+
+  // Both are argv vectors, never a shell string: the address comes from the
+  // daemon and must never be handed to something that parses it.
+  function sshToPeer(peer) {
+    if (!peer || String(peer.ip || "") === "") return false
+    Quickshell.execDetached(Model.sshCommand(peer.ip))
+    return true
+  }
+
+  function pingPeer(peer) {
+    if (!peer || String(peer.ip || "") === "") return false
+    Quickshell.execDetached(Model.pingCommand(peer.ip))
+    return true
+  }
+
+  function openAdminConsole() {
+    var url = adminUrl
+    if (url === "") return false
+    Quickshell.execDetached(["omarchy-launch-browser", url])
     return true
   }
 
@@ -285,6 +350,10 @@ Item {
       return
     }
 
+    // A panel held open across a recovery kept the empty list resetUnavailable
+    // installed, because opening was the only trigger. Notice the transition.
+    var cameBack = (!running && parsed.running) || (daemonDown && parsed.running)
+
     daemonStatus = parsed.daemonStatus
     running = parsed.running
     // Reality caught up to the pending toggle — stop overriding.
@@ -321,6 +390,10 @@ Item {
       _loginInProgress = false
       loginCode = ""
       loginTimeoutTimer.stop()
+    }
+    if (cameBack && panelOpen) {
+      networksRefreshDelay.restart()
+      refreshProfiles()
     }
     // `_loginUrlOpened` is deliberately NOT cleared here. It is owned by the
     // login attempt — set when the browser opens, reset only by `up()` and
@@ -409,6 +482,8 @@ Item {
 
   function runAction(command, label) {
     if (actionProcess.running) return
+    actionStdout.reset()
+    actionStderr.reset()
     actionStatus = label || ""
     actionProcess.command = command
     actionProcess.running = true
@@ -618,12 +693,14 @@ Item {
         return
       }
 
+      // Deliberately NOT clearing the outage here: only a poll whose stdout
+      // parses as a status document counts as recovery. Exit 0 carrying
+      // unusable output is not the daemon saying it is back, and treating it
+      // as such reset the backoff on every garbage reply.
       if (exitCode === 0) {
-        root.clearDaemonDown()
         root.parseStatus(stdout)
         return
       }
-      root.clearDaemonDown()
       // A non-zero exit that still printed a whole status document knows more
       // than "Disconnected" does — a NeedsLogin or degraded daemon can exit
       // non-zero and say so in stdout. `Model.parseStatus` now refuses JSON
@@ -653,11 +730,51 @@ Item {
       // Discard a read that started before the most recent write: it describes
       // a selection the user has already changed, and applying it would flip
       // the row back under them.
-      if (root._networkReadSeq !== root._networkWriteSeq) return
+      // Ordered against completed writes, and rejected outright if a write
+      // started while this read was in flight.
+      if (!Model.shouldApplyNetworksRead(root._networkReadSeq, root._networkWritesCompleted, networkActionProcess.running)) return
       if (exitCode !== 0) return
       root.networks = Model.parseNetworksList(String(networksStdout.tail || ""))
       root.networksLoaded = true
       root.networkDesired = {}
+    }
+  }
+
+  Process {
+    id: profilesProcess
+    running: false
+    command: []
+    stdout: BoundedCollector { id: profilesStdout; limit: 16384 }
+    stderr: BoundedCollector { id: profilesStderr; limit: 16384 }
+    onExited: function(exitCode) {
+      if (exitCode !== 0) return
+      root.profiles = Model.parseProfileList(String(profilesStdout.tail || ""))
+      root.profilesLoaded = true
+    }
+  }
+
+  Process {
+    id: profileActionProcess
+    running: false
+    command: []
+    stdout: BoundedCollector { id: profileActionStdout; limit: 16384 }
+    stderr: BoundedCollector { id: profileActionStderr; limit: 16384 }
+    onExited: function(exitCode) {
+      if (exitCode !== 0) {
+        root.lastError = root.elideStatus(
+          String(profileActionStderr.tail || "") || String(profileActionStdout.tail || "") || "netbird profile select failed")
+        root.actionStatus = root.lastError
+        actionStatusTimer.restart()
+      } else {
+        root.actionStatus = ""
+      }
+      // Switching profiles re-cycles the engine: the daemon may come back
+      // needing a login on the target profile. Let the ordinary states carry
+      // whatever it reports.
+      root.profilesLoaded = false
+      delayedRefresh.restart()
+      networksRefreshDelay.restart()
+      root.refreshProfiles()
     }
   }
 
@@ -675,6 +792,8 @@ Item {
         root.actionStatus = root.lastError
         actionStatusTimer.restart()
       }
+      // The write is done: from here a read can be trusted again.
+      root._networkWritesCompleted += 1
       // Re-read either way: on success to see it, on failure to see the truth.
       networksRefreshDelay.restart()
     }
@@ -709,6 +828,7 @@ Item {
       if (exitCode !== 0) {
         root._desired = -1
         root.lastError = root.elideStatus(stderr || stdout || "netbird command failed")
+        if (actionStderr.truncated || actionStdout.truncated) root.lastError += " (output truncated)"
         root.actionStatus = root.lastError
         actionStatusTimer.restart()
       } else {

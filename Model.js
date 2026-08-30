@@ -632,19 +632,32 @@ function loginProgress(bufferSoFar, newLine, excludeUrl) {
 // The device code `netbird up --no-browser` prints, from the sentence the
 // 0.77.1 binary actually formats: "and enter the code %s to authenticate."
 var VERIFICATION_SENTENCE = /enter the code\s+(\S+?)\s+to authenticate/i
-// A device code is a short run of letters, digits and dashes. Requiring the
-// shape keeps a URL fragment or a dotted address out, even if some future
-// wording puts one where the code goes.
+// A device code is a short run of letters, digits and dashes.
 var VERIFICATION_CODE_SHAPE = /^[A-Za-z0-9][A-Za-z0-9-]{2,}$/
+// Long enough to be a hash rather than something a person retypes.
+var VERIFICATION_CODE_MAX = 64
+// A bare run of hex is a digest, not a device code — those carry a separator
+// or at least a digit among letters outside a-f.
+var VERIFICATION_LOOKS_LIKE_DIGEST = /^[0-9a-f]{24,}$/i
 
 function extractVerificationCode(text) {
-  var match = String(text || "").match(VERIFICATION_SENTENCE)
+  // The sentence can arrive split across lines, since the buffer joins the
+  // CLI's output with newlines. Collapse whitespace before matching so
+  // "enter the\ncode ABCD-EFGH to authenticate" is still one sentence.
+  var flat = String(text || "").replace(/\s+/g, " ")
+  var match = flat.match(VERIFICATION_SENTENCE)
   if (!match) return ""
   var code = trimUrlPunctuation(String(match[1] || ""))
   if (!VERIFICATION_CODE_SHAPE.test(code)) return ""
+  if (code.length > VERIFICATION_CODE_MAX) return ""
   // Never a URL, and never something that is only an address.
   if (code.indexOf("://") !== -1) return ""
   if (/^\d{1,3}(\.\d{1,3}){3}$/.test(code)) return ""
+  // A digest is not a code a person is being asked to type.
+  if (VERIFICATION_LOOKS_LIKE_DIGEST.test(code)) return ""
+  // Real device codes carry a separator or a digit; an all-letter run of this
+  // length is far more likely to be a word from a reworded sentence.
+  if (!/[0-9-]/.test(code)) return ""
   return code
 }
 
@@ -783,6 +796,7 @@ function parseNetworksList(raw) {
 
   var lines = text.split(/\r?\n/)
   var networks = []
+  var pending = []
   var current = null
 
   for (var i = 0; i < lines.length; i++) {
@@ -790,14 +804,17 @@ function parseNetworksList(raw) {
 
     var idMatch = line.match(NETWORK_ID_LINE)
     if (idMatch) {
+      // Held back until the block proves itself complete — see below.
       current = {
         id: idMatch[1],
         network: "",
         domains: [],
         resolvedIps: [],
-        selected: false
+        selected: false,
+        _hasRoute: false,
+        _hasStatus: false
       }
-      networks.push(current)
+      pending.push(current)
       continue
     }
     // Anything before the first "- ID:" is a header or chatter, never a row.
@@ -813,9 +830,33 @@ function parseNetworksList(raw) {
     if (!field) continue
     var key = field[1]
     var value = field[2]
-    if (key === "Network") current.network = value
-    else if (key === "Domains") current.domains = splitList(value)
-    else if (key === "Status") current.selected = value === "Selected"
+    if (key === "Network") {
+      current.network = value
+      current._hasRoute = value !== ""
+    } else if (key === "Domains") {
+      current.domains = splitList(value)
+      current._hasRoute = current.domains.length > 0
+    } else if (key === "Status") {
+      // Only the two values upstream prints count. Anything else means we are
+      // not looking at the table we think we are.
+      if (value === "Selected" || value === "Not Selected") {
+        current.selected = value === "Selected"
+        current._hasStatus = true
+      }
+    }
+  }
+
+  // A row ships only when its block carried an id, a route or domain list, and
+  // a Status the printer actually emits. A stray "- ID:" inside warning text
+  // therefore yields nothing rather than a clickable phantom network — and a
+  // future release that renames these fields degrades to an empty section
+  // rather than to rows that lie.
+  for (var n = 0; n < pending.length; n++) {
+    var entry = pending[n]
+    if (!entry._hasRoute || !entry._hasStatus) continue
+    delete entry._hasRoute
+    delete entry._hasStatus
+    networks.push(entry)
   }
 
   return networks
@@ -828,6 +869,122 @@ function networkDetail(network) {
   if (network.network) return String(network.network)
   var domains = Array.isArray(network.domains) ? network.domains : []
   return domains.join(", ")
+}
+
+// --- networks read/write ordering -------------------------------------------
+//
+// A list read is only trustworthy if no write happened between its start and
+// its finish. Counting writes *started* is not enough: a read that begins while
+// an action is in flight captures the already-incremented number, snapshots the
+// pre-write selection, and then matches on the way out — applying stale rows
+// and clearing the optimistic state. So reads are ordered against writes that
+// have *completed*, and a read is not even started while one is in flight.
+
+function canStartNetworksRead(writeInFlight, readInFlight) {
+  return writeInFlight !== true && readInFlight !== true
+}
+
+function shouldApplyNetworksRead(capturedCompletions, currentCompletions, writeInFlight) {
+  // A write that began after this read started invalidates it, whether or not
+  // it has finished: its result is not in these rows.
+  if (writeInFlight === true) return false
+  return Number(capturedCompletions) === Number(currentCompletions)
+}
+
+// --- profiles ---------------------------------------------------------------
+
+// `netbird profile list` prints a two-column table:
+//
+//     NAME     ACTIVE
+//     default  ✓
+//
+// The header is required. Without it we are looking at a warning, an error, or
+// a future format — and turning arbitrary lines into profiles would put rows in
+// the switcher that run `netbird profile select <that line>` when clicked.
+var PROFILE_HEADER = /^\s*NAME\s+ACTIVE\s*$/
+// Profile names are filesystem-ish identifiers; anything else is not a row.
+var PROFILE_NAME = /^[A-Za-z0-9][A-Za-z0-9._@-]*$/
+var PROFILE_ACTIVE_MARKS = ["✓", "*", "yes", "true", "active"]
+
+function parseProfileList(raw) {
+  var text = String(raw === undefined || raw === null ? "" : raw)
+  var lines = text.split(/\r?\n/)
+
+  var headerAt = -1
+  for (var i = 0; i < lines.length; i++) {
+    if (PROFILE_HEADER.test(lines[i])) { headerAt = i; break }
+  }
+  if (headerAt === -1) return []
+
+  var profiles = []
+  for (var j = headerAt + 1; j < lines.length; j++) {
+    var line = lines[j]
+    if (line.trim() === "") continue
+    var parts = line.trim().split(/\s+/)
+    var name = parts[0]
+    if (!PROFILE_NAME.test(name)) continue
+    var mark = (parts[1] || "").toLowerCase()
+    var active = false
+    for (var m = 0; m < PROFILE_ACTIVE_MARKS.length; m++) {
+      if (mark === PROFILE_ACTIVE_MARKS[m]) { active = true; break }
+    }
+    profiles.push({ name: name, active: active })
+  }
+  return profiles
+}
+
+function profileListCommand() {
+  return timeoutPrefix(DAEMON_TIMEOUT_SEC, DAEMON_KILL_GRACE_SEC).concat(["netbird", "profile", "list"])
+}
+
+function profileSelectCommand(name) {
+  return timeoutPrefix(DAEMON_TIMEOUT_SEC, DAEMON_KILL_GRACE_SEC)
+    .concat(["netbird", "profile", "select", String(name)])
+}
+
+// --- peer actions -----------------------------------------------------------
+//
+// Both are argv vectors handed to execDetached, never a shell string: a peer
+// address comes from the daemon, and the moment it is interpolated into a
+// command line it is one bad character away from being a command.
+function sshCommand(address) {
+  return ["omarchy-launch-terminal", "ssh", String(address)]
+}
+
+function pingCommand(address) {
+  return ["omarchy-launch-terminal", "ping", String(address)]
+}
+
+// --- admin console ----------------------------------------------------------
+//
+// Self-hosted deployments serve the dashboard from the management host itself,
+// so the management URL is the default. The explicit setting always wins.
+function adminConsoleUrl(managementUrl, override) {
+  var explicit = String(override || "").trim()
+  if (explicit !== "") return explicit
+
+  var url = String(managementUrl || "").trim()
+  if (url === "") return ""
+
+  var schemeMatch = url.match(/^([a-z][a-z0-9+.-]*):\/\//i)
+  var scheme = schemeMatch ? schemeMatch[1].toLowerCase() : "https"
+  var rest = schemeMatch ? url.substring(schemeMatch[0].length) : url
+  var authority = rest.split("/")[0].split("?")[0]
+  if (authority === "") return ""
+
+  // Only the default port is dropped; a deployment on 8443 is reachable there
+  // and nowhere else. IPv6 literals keep their brackets.
+  if (authority.charAt(0) === "[") {
+    var close = authority.indexOf("]")
+    if (close !== -1) {
+      var host6 = authority.substring(0, close + 1)
+      var tail6 = authority.substring(close + 1)
+      authority = tail6 === ":443" ? host6 : host6 + tail6
+    }
+  } else {
+    authority = authority.replace(/:443$/, "")
+  }
+  return scheme + "://" + authority
 }
 
 function selectedNetworkCount(networks) {
@@ -962,6 +1119,14 @@ if (typeof module !== "undefined") {
     networksDeselectCommand: networksDeselectCommand,
     networksSelectAllCommand: networksSelectAllCommand,
     networksDeselectAllCommand: networksDeselectAllCommand,
+    canStartNetworksRead: canStartNetworksRead,
+    shouldApplyNetworksRead: shouldApplyNetworksRead,
+    parseProfileList: parseProfileList,
+    profileListCommand: profileListCommand,
+    profileSelectCommand: profileSelectCommand,
+    sshCommand: sshCommand,
+    pingCommand: pingCommand,
+    adminConsoleUrl: adminConsoleUrl,
     upCommand: upCommand,
     downCommand: downCommand,
     statusCommand: statusCommand,

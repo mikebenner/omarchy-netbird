@@ -2,3 +2,4 @@
 // rather than globbing it, so `node --test test/` lands here. Requiring each
 // suite keeps that form working alongside `node --test test/model.test.js`.
 require("./model.test.js")
+require("./manifest.test.js")

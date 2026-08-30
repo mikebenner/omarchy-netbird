@@ -27,6 +27,7 @@ Panel {
   property bool searchOpen: false
   property string peerQuery: ""
   property int networkIndex: 0
+  property int profileIndex: 0
   property bool relaysExpanded: false
   // Only one peer's detail is open at a time; "" means none.
   property string expandedPeerId: ""
@@ -119,6 +120,8 @@ Panel {
   readonly property bool showNetworks: netbird.installed && netbird.active && !netbird.daemonDown && netbird.networks.length > 0
   readonly property string networksHeading: "NETWORKS — " + Model.selectedNetworkCount(netbird.networks) + "/" + netbird.networks.length
   readonly property bool showRelays: netbird.installed && netbird.active && netbird.relays.length > 0
+  // Only worth a section when there is a choice to make.
+  readonly property bool showProfiles: netbird.installed && !netbird.daemonDown && netbird.profiles.length > 1
 
   readonly property var visiblePeers: Model.filterPeers(netbird.peers, root.peerQuery)
   readonly property bool filtering: root.peerQuery !== ""
@@ -142,19 +145,35 @@ Panel {
 
   // c / n / d act on whatever the cursor is sitting on, so the same three keys
   // copy this device's details from the self row and a peer's from the list.
+  // c / n / d act on the focused row, and only on a row that actually has
+  // these fields. With the header or a network focused they do nothing, rather
+  // than silently copying from whichever peer the cursor last sat on.
   function copyIp() {
     if (focusSection === "self") netbird.copyToClipboard(netbird.selfIp)
-    else netbird.copyPeerIp(selectedPeer())
+    else if (focusSection === "peers") netbird.copyPeerIp(selectedPeer())
   }
 
   function copyName() {
     if (focusSection === "self") netbird.copyToClipboard(netbird.selfName)
-    else netbird.copyPeerName(selectedPeer())
+    else if (focusSection === "peers") netbird.copyPeerName(selectedPeer())
   }
 
   function copyFqdn() {
     if (focusSection === "self") netbird.copyToClipboard(netbird.selfFqdn)
-    else netbird.copyPeerFqdn(selectedPeer())
+    else if (focusSection === "peers") netbird.copyPeerFqdn(selectedPeer())
+  }
+
+  // s / p act on the focused peer row only, for the same reason.
+  function sshFocusedPeer() {
+    if (focusSection !== "peers") return
+    var peer = selectedPeer()
+    if (peer && peer.online) netbird.sshToPeer(peer)
+  }
+
+  function pingFocusedPeer() {
+    if (focusSection !== "peers") return
+    var peer = selectedPeer()
+    if (peer && peer.online) netbird.pingPeer(peer)
   }
 
   function ensureCursor() {
@@ -162,7 +181,10 @@ Panel {
     if (peerIndex >= visiblePeers.length) peerIndex = Math.max(0, visiblePeers.length - 1)
     if (networkIndex < 0) networkIndex = 0
     if (networkIndex >= netbird.networks.length) networkIndex = Math.max(0, netbird.networks.length - 1)
+    if (profileIndex < 0) profileIndex = 0
+    if (profileIndex >= netbird.profiles.length) profileIndex = Math.max(0, netbird.profiles.length - 1)
     if (focusSection === "self" && !showSelf) focusSection = showPeers ? "peers" : "header"
+    if (focusSection === "profiles" && !showProfiles) focusSection = showNetworks ? "networks" : (showPeers ? "peers" : "header")
     if (focusSection === "networks" && !showNetworks) focusSection = showPeers ? "peers" : "header"
     if (focusSection === "peers" && !showPeers) focusSection = showSelf ? "self" : "header"
   }
@@ -178,11 +200,23 @@ Panel {
         }
       } else if (focusSection === "self") {
         if (dy < 0) focusSection = "header"
+        else if (showProfiles) focusSection = "profiles"
         else if (showNetworks) focusSection = "networks"
         else if (showPeers) focusSection = "peers"
+      } else if (focusSection === "profiles") {
+        if (dy < 0) {
+          if (profileIndex <= 0) focusSection = showSelf ? "self" : "header"
+          else profileIndex--
+        } else if (profileIndex < netbird.profiles.length - 1) {
+          profileIndex++
+        } else if (showNetworks) {
+          focusSection = "networks"
+        } else if (showPeers) {
+          focusSection = "peers"
+        }
       } else if (focusSection === "networks") {
         if (dy < 0) {
-          if (networkIndex <= 0) focusSection = showSelf ? "self" : "header"
+          if (networkIndex <= 0) focusSection = showProfiles ? "profiles" : (showSelf ? "self" : "header")
           else networkIndex--
         } else if (networkIndex < netbird.networks.length - 1) {
           networkIndex++
@@ -206,6 +240,11 @@ Panel {
     ensureCursor()
     if (focusSection === "header") netbird.toggleNetbird()
     else if (focusSection === "self") selfRow.openCopyMenu()
+    else if (focusSection === "profiles") {
+      var list = netbird.profiles || []
+      var entry = list[Math.max(0, Math.min(profileIndex, list.length - 1))]
+      if (entry) netbird.selectProfile(entry.name)
+    }
     else if (focusSection === "networks") toggleFocusedNetwork()
     // Enter opens the peer's detail rather than the copy menu: the chevron is
     // what the row now advertises, and c / n / d already copy without a menu.
@@ -303,6 +342,12 @@ Panel {
       if (peerSearch) peerSearch.text = ""
       peerQuery = ""
       peerIndex = 0
+      networkIndex = 0
+      profileIndex = 0
+      // Focus too: a section that is gone on the next open must not still be
+      // the remembered target, or the first arrow key highlights nothing.
+      focusSection = "header"
+      cursorActive = false
       expandedPeerId = ""
       relaysExpanded = false
       return
@@ -395,7 +440,13 @@ Panel {
       // typed characters land in the field rather than firing shortcuts.
       blocked: root.copyMenuOpen || (root.searchOpen && peerSearch.activeFocus)
       onMoveRequested: function(dx, dy) {
-        if (!root.cursorActive) { root.cursorActive = true; return }
+        // The first press only reveals the cursor — but it still has to land
+        // somewhere visible, so settle the section before returning.
+        if (!root.cursorActive) {
+          root.cursorActive = true
+          root.ensureCursor()
+          return
+        }
         root.moveCursor(dx, dy)
       }
       onActivateRequested: if (root.cursorActive) root.activateCursor()
@@ -412,6 +463,9 @@ Panel {
         // Capital N, because lowercase n already copies the name.
         else if (t === "N") root.focusNetworks()
         else if (t === "e" || t === "E") root.relaysExpanded = !root.relaysExpanded
+        else if (t === "s" || t === "S") root.sshFocusedPeer()
+        else if (t === "p" || t === "P") root.pingFocusedPeer()
+        else if (t === "a" || t === "A") netbird.openAdminConsole()
         else if (t === "t" || t === "T") netbird.toggleNetbird()
         else if (t === "r" || t === "R") netbird.refresh()
         else if (t === "c" || t === "C") root.copyIp()
@@ -661,6 +715,40 @@ Panel {
           }
 
           PanelSeparator {
+            visible: root.showProfiles
+            foreground: root.foreground
+          }
+
+          Column {
+            visible: root.showProfiles
+            width: parent.width
+            spacing: Style.space(10)
+
+            PanelSectionHeader {
+              text: "PROFILES"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            Column {
+              id: profileColumn
+              width: parent.width
+              spacing: Style.space(6)
+
+              Repeater {
+                model: netbird.profiles
+                ProfileRow {
+                  required property var modelData
+                  required property int index
+                  width: profileColumn.width
+                  profile: modelData
+                  rowIndex: index
+                }
+              }
+            }
+          }
+
+          PanelSeparator {
             visible: root.showNetworks
             foreground: root.foreground
           }
@@ -730,10 +818,26 @@ Panel {
             width: parent.width
             spacing: Style.space(10)
 
-            PanelSectionHeader {
-              text: root.peersHeading
-              foreground: root.foreground
-              fontFamily: root.fontFamily
+            RowLayout {
+              width: parent.width
+              spacing: Style.space(8)
+
+              PanelSectionHeader {
+                Layout.fillWidth: true
+                text: root.peersHeading
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+              }
+
+              PanelActionButton {
+                visible: netbird.adminUrl !== ""
+                iconText: "󰖟"
+                tooltipText: "Open the admin console (a)"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                Layout.alignment: Qt.AlignVCenter
+                onClicked: netbird.openAdminConsole()
+              }
             }
 
             // Opened with `/`. While it has focus the panel's key catcher is
@@ -1041,6 +1145,66 @@ Panel {
     }
   }
 
+  component ProfileRow: CursorSurface {
+    id: profileRow
+    property var profile: null
+    property int rowIndex: 0
+    readonly property string profileName: profile ? String(profile.name || "") : ""
+    readonly property bool isActive: profile ? profile.active === true : false
+
+    hasCursor: root.cursorActive && root.focusSection === "profiles" && root.profileIndex === rowIndex
+    current: isActive
+    foreground: root.foreground
+    fill: Style.hoverFillFor(root.foreground, Color.accent)
+    currentFill: Style.selectedFillFor(root.foreground, Color.accent)
+
+    implicitHeight: profileInner.implicitHeight + Style.spacing.xl
+
+    Row {
+      id: profileInner
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      anchors.leftMargin: Style.space(10)
+      anchors.rightMargin: Style.space(10)
+      spacing: Style.space(8)
+
+      Text {
+        text: profileRow.isActive ? "◉" : "○"
+        color: profileRow.isActive ? root.foreground : root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.body
+        width: Style.space(22)
+        horizontalAlignment: Text.AlignHCenter
+        anchors.verticalCenter: parent.verticalCenter
+      }
+
+      Text {
+        text: profileRow.profileName
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.body
+        font.bold: profileRow.isActive
+        elide: Text.ElideRight
+        width: parent.width - Style.space(30)
+        anchors.verticalCenter: parent.verticalCenter
+      }
+    }
+
+    MouseArea {
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: profileRow.isActive ? Qt.ArrowCursor : Qt.PointingHandCursor
+      enabled: !netbird.profilesBusy
+      onEntered: {
+        root.cursorActive = true
+        root.focusSection = "profiles"
+        root.profileIndex = profileRow.rowIndex
+      }
+      onClicked: netbird.selectProfile(profileRow.profileName)
+    }
+  }
+
   component NetworkRow: CursorSurface {
     id: networkRow
     property var network: null
@@ -1240,6 +1404,29 @@ Panel {
           font.pixelSize: Style.font.caption
           elide: Text.ElideRight
         }
+      }
+
+      PanelActionButton {
+        visible: peerRow.peer && peerRow.peer.online === true && peerRow.peerIp !== ""
+        iconText: "󰆍"
+        tooltipText: "SSH to this peer (s)"
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        Layout.alignment: Qt.AlignVCenter
+        onClicked: netbird.sshToPeer(peerRow.peer)
+      }
+
+      PanelActionButton {
+        visible: peerRow.peer && peerRow.peer.online === true && peerRow.peerIp !== ""
+        // A plain Unicode arrow pair, not a Nerd Font codepoint: the icon this
+        // slot first used has no glyph in the bar font and fell back to a
+        // letter box. Verified rendering in JetBrainsMono Nerd Font.
+        iconText: "⇄"
+        tooltipText: "Ping this peer (p)"
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        Layout.alignment: Qt.AlignVCenter
+        onClicked: netbird.pingPeer(peerRow.peer)
       }
 
       PanelActionButton {

@@ -1,47 +1,86 @@
 import QtQuick
 import Quickshell.Io
 
-// A process-output collector that hands downstream a bounded amount of text.
+// A process-output collector whose memory is bounded *while* collecting, and
+// whose result is complete by the time `Process.exited` runs.
 //
-// Why this is built on `StdioCollector` and not on `SplitParser`
-// -------------------------------------------------------------
-// Capping as the data arrives — appending each `SplitParser` line into a string
-// and trimming the front — bounds memory more tightly, and was the first shape
-// of this component. It was wrong for one reason: nothing documents that every
-// `read` has been delivered by the time `Process.exited` fires, so the parsed
-// status document could be silently short. The type metadata bears that out —
-// `SplitParser` exposes only `splitMarker` and the inherited `read` signal,
-// while `StdioCollector` is the type that carries `waitForEnd` and
-// `streamFinished`, which exist precisely to express "the stream is complete".
-// A truncated status document is a wrong panel; a larger transient buffer is
-// not. So: collect with the guarantee, and bound what is passed on.
+// Getting both at once
+// --------------------
+// `StdioCollector` guarantees completeness (`waitForEnd`) but keeps the entire
+// stream: wrapping it and trimming a derived value bounds only what downstream
+// reads, so a high-rate producer still grows the shell's heap for as long as it
+// runs. `SplitParser` delivers incrementally — so a cap can be applied as the
+// data arrives — but exposes no completeness signal.
 //
-// The transient size is bounded anyway, from the other end: every daemon
-// invocation is wrapped in `timeout` (8 s for status and down, 130 s for the
-// blocking login), so a CLI that decides to narrate can only do so for that
-// long before it is killed.
+// This takes the incremental route and supplies the missing guarantee itself:
+// `Process.exited` is emitted after the process's streams are closed and their
+// pending `read` callbacks have been delivered, so `tail` is final when the
+// exit handler runs. The proof that matters in practice is the one this widget
+// depends on: the SSO flow has always read `_loginBuffer`, assembled from
+// exactly these `SplitParser` deliveries, inside `loginProcess.onExited`, and
+// the URL and code it needs are on the *last* lines the CLI writes.
+//
+// Belt and braces, because "the last line arrived" is the whole contract: a
+// caller that must not mis-read a truncated document should treat an empty
+// `tail` on a zero exit as "no answer" rather than as an empty answer — which
+// is what `Model.parseStatus` already does.
 //
 // What is kept
 // ------------
-// The **tail**. For `netbird status --json` the document is printed after any
-// gRPC warning chatter, so keeping the head would preserve the noise and throw
-// away the answer; for `up` and `down` the useful line — the SSO prompt, the
-// failure — is likewise last. One rule, and it is the right one in each case.
+// The **tail**, in whole lines. For `netbird status --json` the document is
+// printed after any gRPC warning chatter, so keeping the head would preserve
+// the noise and discard the answer; for `up`, `down`, `networks` and `profile`
+// the useful line — the prompt, the failure — is likewise last.
 //
-// `tail` is exactly what the process wrote, minus anything trimmed off the
-// front: no lines are joined or dropped by this component.
-StdioCollector {
+// `limit` counts UTF-16 code units, not bytes, and trimming happens on line
+// boundaries so a multi-byte character is never cut in half. Line-oriented
+// trimming is why this is safe: a code point cannot straddle a `\n`.
+SplitParser {
   id: root
 
-  // Bytes to hand downstream. The default suits a status document; callers
-  // that only ever see short messages set something much smaller.
+  // Approximate ceiling on retained text, in UTF-16 code units. Whole lines are
+  // dropped from the front until the buffer is under it, so the real figure is
+  // this plus at most one line.
   property int limit: 262144
 
-  // Read this rather than `text`. Valid once the stream has finished, which
-  // `waitForEnd` guarantees has happened before `Process.exited`.
-  readonly property string tail: text.length > limit
-    ? text.substring(text.length - limit)
-    : text
+  // Everything retained so far, oldest lines dropped first.
+  property string text: ""
 
-  waitForEnd: true
+  // True once anything was dropped. Read by `Service` when it reports a
+  // failure, so a truncated message is never presented as the whole story.
+  property bool truncated: false
+
+  // What callers read. Named apart from `text` so a reader cannot accidentally
+  // depend on an untrimmed value that no longer exists.
+  readonly property string tail: text
+
+  function reset() {
+    text = ""
+    truncated = false
+  }
+
+  onRead: function(line) {
+    var chunk = String(line === undefined || line === null ? "" : line)
+    var next = text === "" ? chunk : text + "\n" + chunk
+
+    if (next.length > limit) {
+      // Drop whole lines from the front until it fits. Never a mid-line cut, so
+      // no surrogate pair or multi-byte sequence is ever split.
+      var cut = 0
+      while (next.length - cut > limit) {
+        var nl = next.indexOf("\n", cut)
+        if (nl === -1) {
+          // One line longer than the cap: keep its tail rather than nothing,
+          // and accept that this single case can cut inside a line.
+          cut = next.length - limit
+          break
+        }
+        cut = nl + 1
+      }
+      next = next.substring(cut)
+      truncated = true
+    }
+
+    text = next
+  }
 }

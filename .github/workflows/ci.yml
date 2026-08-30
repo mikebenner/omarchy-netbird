@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Tests and manifest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
+      # Model.js is plain ES5 with a CommonJS export, so there is nothing to
+      # install and nothing to build. `test/manifest.test.js` mirrors the checks
+      # `omarchy plugin validate` makes, so the same run covers both here and on
+      # a developer's machine.
+      - name: Run tests
+        run: node --test test/

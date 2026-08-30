@@ -36,6 +36,9 @@ menus. Everything it knows comes from the `netbird` CLI.
   negotiated ICE pair, last handshake, transfer, latency, advertised routes
 - Expandable **relay list** behind the relay count, showing which one failed
 - A notice when the CLI and daemon versions disagree
+- **Profiles**: switch NetBird accounts, when more than one profile exists
+- SSH or ping a connected peer in a new terminal
+- One key to the admin console
 
 ## Requirements
 
@@ -92,6 +95,7 @@ Change them with `omarchy bar set`:
 |---|---|---|---|---|
 | `refreshIntervalSec` | integer | `30` | 5–3600 | How often `netbird status --json` is polled |
 | `iconStyle` | enum | `theme` | `theme`, `color` | Themed vector mark, or NetBird's own coloured artwork |
+| `adminConsoleUrl` | string | *(empty)* | any URL | Where `a` opens. Empty derives it from the management URL |
 
 ```bash
 omarchy bar set mikebenner.netbird refreshIntervalSec 15
@@ -126,16 +130,24 @@ Connected · laptop · 100.64.0.9 · 1/4 peers · session expires in 1d 6h
 Inside the panel:
 
 - `j` / `k` or arrows: move cursor
-- `enter` / `space`: activate current row (toggle on the hero, copy menu on a
-  device or peer row)
-- `c`: copy the selected row's NetBird address
-- `n`: copy the selected row's short name
-- `d`: copy the selected row's FQDN
+- `enter` / `space`: activate the current row — the switch on the hero, the
+  copy menu on the device row, the detail on a peer row, the toggle on a
+  network, the switch on a profile
+- `c`: copy the focused row's NetBird address
+- `n`: copy the focused row's short name
+- `d`: copy the focused row's FQDN
+
+  These three act on the device row or a peer row. With the header, a network
+  or a profile focused they do nothing, rather than copying from whichever peer
+  the cursor last visited. The peer copy menu — which adds the public key — is
+  on the row's copy button.
 - `/`: filter the peer list; type to narrow, `enter` or `↓` to move into the
   results, `esc` to clear and close
 - `enter` on a peer row: show or hide that peer's detail
 - `N`: jump to the NETWORKS section (`space`/`enter` toggles the focused row)
 - `e`: show or hide the relay list
+- `s` / `p`: SSH to, or ping, the focused **connected** peer in a new terminal
+- `a`: open the admin console in your browser
 - `t`: toggle NetBird
 - `r`: refresh status
 - `esc`: close the filter if it is open, else cancel a sign-in in progress,
@@ -233,6 +245,26 @@ whose range is `0.0.0.0/0`.
 The section is hidden when the daemon reports no networks, and the list is only
 read while the panel is open.
 
+## Profiles
+
+A **PROFILES** section appears when the daemon knows more than one profile —
+with a single profile there is nothing to choose, so it stays hidden. Picking a
+row runs `netbird profile select <name>`.
+
+Switching re-cycles the engine, so expect a brief reconnect, and expect the
+target profile to ask for a login if its session has expired. The widget does
+not treat that as an error: the ordinary needs-login state carries it, and the
+sign-in flow is the same one described above.
+
+## Admin console
+
+`a`, or the button in the PEERS header, opens the admin console. By default the
+URL is derived from the management URL — right for most self-hosted
+deployments, where the dashboard is served from the management host. Set
+`adminConsoleUrl` explicitly for NetBird Cloud (`https://app.netbird.io`) or a
+split dashboard host. Only the default `:443` is dropped when deriving; a
+management URL on another port keeps it.
+
 ## When the daemon is not running
 
 `netbird status` does not fail when the daemon is stopped — it retries the
@@ -245,8 +277,11 @@ running** state, distinct from "disconnected":
 - the hero reads "NetBird daemon is not running"
 - the peer list is cleared rather than left showing what was true before
 - the toggle is disabled — there is nothing for it to talk to
-- polling backs off 5 s → 10 → 20 → 40 → 60 and stays at a minute until the
-  daemon answers, then snaps straight back to `refreshIntervalSec`
+- polling backs off, but never below your refresh interval: at the 30 s default
+  that is 30 s, 30, 30, then 40 and a 60 s cap; only a shorter interval sees the
+  earlier 5/10/20 steps. It snaps straight back on the first poll that returns
+  a real status document — a clean exit carrying unusable output does not count
+  as recovery.
 
 The panel points you at `systemctl status netbird`. The widget never starts or
 stops the daemon itself.
@@ -260,9 +295,10 @@ Two deliberate edges in the parsing, both chosen over guessing:
   internationalised management URL and its punycode spelling
   (`bücher.example` vs `xn--bcher-kva.example`) do not compare equal.
 - `netbird networks list` has no `--json`, so its output is parsed as text
-  against the format NetBird 0.77.1 prints. A future release that changes that
-  wording would show an empty NETWORKS section rather than wrong rows: a block
-  is only accepted when it opens with an `- ID:` line.
+  against the format NetBird 0.77.1 prints. A row ships only when its block
+  carries an id, a `Network:` or `Domains:` line, and a `Status:` value the
+  printer actually emits — so a release that renames those fields shows an
+  empty NETWORKS section rather than rows that lie.
 - When `netbird status --json` prefixes its document with chatter, the
   recovery sweep tries at most 32 candidate object starts. Brace-bearing prose
   (`WARNING grpc target {Addr:"/run/netbird.sock"}`) is skipped without
