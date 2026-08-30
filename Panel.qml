@@ -5,6 +5,7 @@ import Quickshell
 import Quickshell.Io
 import qs.Commons
 import qs.Ui
+import "Model.js" as Model
 
 // NetBird in the Omarchy bar, modeled on the first-party Tailscale widget:
 // a bar icon that reflects the daemon, a keyboard-driven popup with a power
@@ -23,13 +24,15 @@ Panel {
   property int peerIndex: 0
   property bool cursorActive: false
   property bool copyMenuOpen: false
+  property bool searchOpen: false
+  property string peerQuery: ""
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color urgent: bar ? bar.urgent : Color.urgent
   readonly property color dim: Qt.darker(foreground, 1.55)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property bool showSelf: netbird.installed && netbird.active && (netbird.selfIp !== "" || netbird.selfFqdn !== "")
-  readonly property bool showPeers: netbird.active && netbird.peers.length > 0
+  readonly property bool showPeers: netbird.active && visiblePeers.length > 0
   // Only claim the header cursor when the switch is actually on screen —
   // "header" stays navigable, but an absent CLI leaves nothing to highlight.
   readonly property bool headerHasCursor: cursorActive && focusSection === "header" && netbird.installed
@@ -64,18 +67,26 @@ Panel {
   // it.
   readonly property string iconState: {
     if (!netbird.installed) return "notInstalled"
+    // A daemon that cannot be reached is an error, not an "off" — the tunnel
+    // state is unknown, and the fix is not the toggle.
+    if (netbird.daemonDown) return "error"
     if (netbird.needsLogin) return "needsLogin"
     if (netbird.active && netbird.degraded) return "error"
     if (netbird.daemonStatus === "Connecting" || togglePending || peersConnectingOnly) return "connecting"
     return netbird.active ? "connected" : "disconnected"
   }
-  readonly property string toggleHint: netbird.active ? "Turn NetBird off" : (netbird.needsLogin ? "Sign in to NetBird" : "Turn NetBird on")
-  readonly property string barTooltip: netbird.installed
-    ? (netbird.statusText + (netbird.peerCountText !== "" ? " · " + netbird.peerCountText + " peers" : ""))
-    : "NetBird is not installed"
+  readonly property string toggleHint: netbird.daemonDown
+    ? "The NetBird daemon is not running"
+    : (netbird.active ? "Turn NetBird off" : (netbird.needsLogin ? "Sign in to NetBird" : "Turn NetBird on"))
+  readonly property string barTooltip: !netbird.installed
+    ? "NetBird is not installed"
+    : (netbird.daemonDown
+      ? "NetBird daemon is not running"
+      : netbird.statusText + (netbird.peerCountText !== "" ? " · " + netbird.peerCountText + " peers" : ""))
 
   readonly property string heroMeta: {
     if (!netbird.installed) return ""
+    if (netbird.daemonDown) return "NetBird daemon is not running"
     if (netbird.needsLogin) return "Sign in to join the network"
     if (!netbird.active) return "NetBird is disconnected"
     // Session first: on a self-hosted management domain the two together
@@ -98,6 +109,12 @@ Panel {
     return parts.join(" · ")
   }
 
+  readonly property var visiblePeers: Model.filterPeers(netbird.peers, root.peerQuery)
+  readonly property bool filtering: root.peerQuery !== ""
+  readonly property string peersHeading: filtering
+    ? "PEERS — " + visiblePeers.length + " OF " + netbird.peers.length
+    : "PEERS"
+
   readonly property var selfCopyOptions: {
     var options = []
     if (netbird.selfName !== "") options.push({ kind: "name", label: netbird.selfName })
@@ -107,8 +124,9 @@ Panel {
   }
 
   function selectedPeer() {
-    if (netbird.peers.length === 0) return null
-    return netbird.peers[Math.max(0, Math.min(peerIndex, netbird.peers.length - 1))]
+    var list = root.visiblePeers
+    if (list.length === 0) return null
+    return list[Math.max(0, Math.min(peerIndex, list.length - 1))]
   }
 
   // c / n / d act on whatever the cursor is sitting on, so the same three keys
@@ -130,7 +148,7 @@ Panel {
 
   function ensureCursor() {
     if (peerIndex < 0) peerIndex = 0
-    if (peerIndex >= netbird.peers.length) peerIndex = Math.max(0, netbird.peers.length - 1)
+    if (peerIndex >= visiblePeers.length) peerIndex = Math.max(0, visiblePeers.length - 1)
     if (focusSection === "self" && !showSelf) focusSection = showPeers ? "peers" : "header"
     if (focusSection === "peers" && !showPeers) focusSection = showSelf ? "self" : "header"
   }
@@ -151,7 +169,7 @@ Panel {
         if (dy < 0) {
           if (peerIndex <= 0) focusSection = showSelf ? "self" : "header"
           else peerIndex--
-        } else if (peerIndex < netbird.peers.length - 1) {
+        } else if (peerIndex < visiblePeers.length - 1) {
           peerIndex++
         }
       }
@@ -203,6 +221,20 @@ Panel {
   function setSelfCursor() {
     cursorActive = true
     focusSection = "self"
+  }
+
+  function openSearch() {
+    if (!showPeers && netbird.peers.length === 0) return
+    searchOpen = true
+    Qt.callLater(function() { if (peerSearch) peerSearch.forceActiveFocus() })
+  }
+
+  function closeSearch() {
+    searchOpen = false
+    if (peerSearch) peerSearch.text = ""
+    peerQuery = ""
+    peerIndex = 0
+    if (root.opened) Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
 
   function setHeaderCursor() {
@@ -289,16 +321,25 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      blocked: root.copyMenuOpen
+      // Blocked while a copy menu is up or the filter field has focus, so
+      // typed characters land in the field rather than firing shortcuts.
+      blocked: root.copyMenuOpen || (root.searchOpen && peerSearch.activeFocus)
       onMoveRequested: function(dx, dy) {
         if (!root.cursorActive) { root.cursorActive = true; return }
         root.moveCursor(dx, dy)
       }
       onActivateRequested: if (root.cursorActive) root.activateCursor()
-      onCloseRequested: root.close()
+      onCloseRequested: {
+        // Escape unwinds one layer at a time: the filter, then a login in
+        // flight, then the panel.
+        if (root.searchOpen) root.closeSearch()
+        else if (netbird.loginActive) netbird.cancelLogin()
+        else root.close()
+      }
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(t) {
-        if (t === "t" || t === "T") netbird.toggleNetbird()
+        if (t === "/") root.openSearch()
+        else if (t === "t" || t === "T") netbird.toggleNetbird()
         else if (t === "r" || t === "R") netbird.refresh()
         else if (t === "c" || t === "C") root.copyIp()
         else if (t === "n" || t === "N") root.copyName()
@@ -360,7 +401,11 @@ Panel {
                   id: powerSwitch
                   visible: netbird.installed
                   checked: netbird.active
-                  busy: netbird.busy
+                  // Swallow clicks while the daemon is unreachable: there is
+                  // nothing for up or down to talk to, and the service refuses
+                  // them anyway.
+                  busy: netbird.busy || netbird.daemonDown
+                  opacity: netbird.daemonDown ? 0.5 : 1.0
                   hasCursor: header.ringVisible
                   foreground: hero.foreground
                   onHovered: function(on) { if (on) header.focusHero() }
@@ -384,6 +429,99 @@ Panel {
             font.family: root.fontFamily
             font.pixelSize: Style.font.bodySmall
             wrapMode: Text.WordWrap
+          }
+
+          // The daemon is not answering. Say so, and say what to check —
+          // the toggle cannot help here, so it is disabled rather than left
+          // looking like the fix.
+          CursorSurface {
+            visible: netbird.daemonDown
+            width: parent.width
+            implicitHeight: daemonDownText.implicitHeight + Style.spacing.rowPaddingX
+            foreground: root.foreground
+
+            Text {
+              id: daemonDownText
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              anchors.margins: Style.space(12)
+              text: "The NetBird CLI is installed but the daemon is not answering. Check it with systemctl status netbird."
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              wrapMode: Text.WordWrap
+            }
+          }
+
+          // The device code an SSO login is waiting on, with the two things
+          // you want while looking at it: a way to copy it, and a way out.
+          // Shown for as long as `netbird up` runs, not only when it printed a
+          // code: a login that only ever emits a URL still needs a way out.
+          CursorSurface {
+            visible: netbird.loginActive
+            width: parent.width
+            implicitHeight: loginCodeRow.implicitHeight + Style.spacing.rowPaddingX
+            foreground: root.foreground
+
+            RowLayout {
+              id: loginCodeRow
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              anchors.leftMargin: Style.space(10)
+              anchors.rightMargin: Style.space(8)
+              spacing: Style.space(10)
+
+              ColumnLayout {
+                Layout.fillWidth: true
+                spacing: Style.space(2)
+
+                Text {
+                  Layout.fillWidth: true
+                  text: netbird.loginCode !== ""
+                    ? "Enter this code to finish signing in"
+                    : "Finish signing in to NetBird in your browser"
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  elide: Text.ElideRight
+                  wrapMode: Text.WordWrap
+                }
+
+                Text {
+                  visible: netbird.loginCode !== ""
+                  Layout.fillWidth: true
+                  text: netbird.loginCode
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.title
+                  font.bold: true
+                  font.letterSpacing: 2
+                  elide: Text.ElideRight
+                }
+              }
+
+              PanelActionButton {
+                visible: netbird.loginCode !== ""
+                iconText: "󰆏"
+                tooltipText: "Copy code"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                Layout.alignment: Qt.AlignVCenter
+                onClicked: netbird.copyToClipboard(netbird.loginCode)
+              }
+
+              PanelActionButton {
+                iconText: "󰅖"
+                tooltipText: "Cancel sign-in (esc)"
+                foreground: root.foreground
+                hoverColor: root.urgent
+                fontFamily: root.fontFamily
+                Layout.alignment: Qt.AlignVCenter
+                onClicked: netbird.cancelLogin()
+              }
+            }
           }
 
           CursorSurface {
@@ -425,9 +563,41 @@ Panel {
             spacing: Style.space(10)
 
             PanelSectionHeader {
-              text: "PEERS"
+              text: root.peersHeading
               foreground: root.foreground
               fontFamily: root.fontFamily
+            }
+
+            // Opened with `/`. While it has focus the panel's key catcher is
+            // blocked, so typed characters reach the field instead of being
+            // read as shortcuts.
+            TextField {
+              id: peerSearch
+              visible: root.searchOpen
+              width: parent.width
+              foreground: root.foreground
+              placeholderText: "Filter peers — name, address, transport, state"
+              // One-way: the field is the source of truth and `peerQuery`
+              // follows it. Binding `text` back to `peerQuery` meant clearing
+              // the property on close did not necessarily clear the field, so
+              // `/` reopened showing a stale query over an unfiltered list.
+              onTextChanged: {
+                root.peerQuery = text
+                root.peerIndex = 0
+              }
+              Keys.onPressed: function(event) {
+                if (event.key === Qt.Key_Escape) {
+                  root.closeSearch()
+                  event.accepted = true
+                  return
+                }
+                if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Down) {
+                  root.cursorActive = true
+                  root.focusSection = "peers"
+                  keyCatcher.forceActiveFocus()
+                  event.accepted = true
+                }
+              }
             }
 
             Text {
@@ -440,6 +610,17 @@ Panel {
               horizontalAlignment: Text.AlignHCenter
             }
 
+            Text {
+              visible: netbird.active && netbird.peers.length > 0 && root.visiblePeers.length === 0
+              width: parent.width
+              text: "No peer matches " + root.peerQuery
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              horizontalAlignment: Text.AlignHCenter
+              elide: Text.ElideRight
+            }
+
             Column {
               id: peerColumn
               visible: root.showPeers
@@ -447,7 +628,7 @@ Panel {
               spacing: Style.space(6)
 
               Repeater {
-                model: netbird.peers
+                model: root.visiblePeers
                 PeerRow {
                   required property var modelData
                   required property int index

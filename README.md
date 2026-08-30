@@ -24,7 +24,12 @@ menus. Everything it knows comes from the `netbird` CLI.
 - Copy a peer's name, FQDN, or NetBird address
 - SSO login: when the daemon needs to re-authenticate, the widget runs
   `netbird up --no-browser`, picks the login URL out of its output, and hands
-  it to `omarchy-launch-browser`
+  it to `omarchy-launch-browser`. The device code the CLI prints is shown
+  large in the panel with a copy button and a cancel button beside it.
+- Filter the peer list with `/` — matches name, FQDN, address, transport and
+  state, and the section header counts what is showing
+- Tells you when the **daemon itself** is not running, instead of showing a
+  stale peer list
 
 ## Requirements
 
@@ -120,9 +125,12 @@ Inside the panel:
 - `c`: copy the selected row's NetBird address
 - `n`: copy the selected row's short name
 - `d`: copy the selected row's FQDN
+- `/`: filter the peer list; type to narrow, `enter` or `↓` to move into the
+  results, `esc` to clear and close
 - `t`: toggle NetBird
 - `r`: refresh status
-- `esc`: close
+- `esc`: close the filter if it is open, else cancel a sign-in in progress,
+  else close the panel
 
 ## Replaces netbird-ui-bin
 
@@ -184,6 +192,7 @@ state itself; there is no crossed-out overlay drawn on top.
 | disconnected | `disconnected` | daemon `Idle`/`Disconnected` |
 | error | `error` | daemon `Connected` but management or signal is not |
 | needs login | `needs-login` | daemon `NeedsLogin`, `SessionExpired` or `LoginFailed` |
+| daemon not running | `error` | the `netbird` CLI is there but the daemon is not answering |
 | not installed | `disconnected`, faded | no `netbird` on `PATH` |
 
 In `theme` style the badges are drawn to mirror the official artwork: a check
@@ -195,6 +204,24 @@ BSD-3-Clause, taken unmodified from
 [netbirdio/netbird](https://github.com/netbirdio/netbird) — see
 [`assets/NOTICE`](assets/NOTICE) for the pinned commit, the exact upstream
 paths, checksums, and licence.
+
+## When the daemon is not running
+
+`netbird status` does not fail when the daemon is stopped — it retries the
+socket forever, printing gRPC warnings and never exiting. Every call the widget
+makes is therefore wrapped in `timeout`, and a call that times out or that
+reports it could not dial the daemon socket puts the widget into a **daemon not
+running** state, distinct from "disconnected":
+
+- the bar icon shows the error treatment
+- the hero reads "NetBird daemon is not running"
+- the peer list is cleared rather than left showing what was true before
+- the toggle is disabled — there is nothing for it to talk to
+- polling backs off 5 s → 10 → 20 → 40 → 60 and stays at a minute until the
+  daemon answers, then snaps straight back to `refreshIntervalSec`
+
+The panel points you at `systemctl status netbird`. The widget never starts or
+stops the daemon itself.
 
 ## Limitations
 

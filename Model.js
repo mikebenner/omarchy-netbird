@@ -522,21 +522,167 @@ function loginProgress(bufferSoFar, newLine, excludeUrl) {
   // guarantee belongs here, not only in the caller's flag.
   var url = extractAuthUrl(buffer, excludeUrl)
   if (url !== "" && extractAuthUrl(previous, excludeUrl) !== "") url = ""
-  return { buffer: buffer, url: url }
+  // The code, unlike the URL, is reported every time it is present: it is
+  // displayed for as long as the login runs rather than acted on once.
+  return { buffer: buffer, url: url, code: extractVerificationCode(buffer) }
+}
+
+// The device code `netbird up --no-browser` prints, from the sentence the
+// 0.77.1 binary actually formats: "and enter the code %s to authenticate."
+var VERIFICATION_SENTENCE = /enter the code\s+(\S+?)\s+to authenticate/i
+// A device code is a short run of letters, digits and dashes. Requiring the
+// shape keeps a URL fragment or a dotted address out, even if some future
+// wording puts one where the code goes.
+var VERIFICATION_CODE_SHAPE = /^[A-Za-z0-9][A-Za-z0-9-]{2,}$/
+
+function extractVerificationCode(text) {
+  var match = String(text || "").match(VERIFICATION_SENTENCE)
+  if (!match) return ""
+  var code = trimUrlPunctuation(String(match[1] || ""))
+  if (!VERIFICATION_CODE_SHAPE.test(code)) return ""
+  // Never a URL, and never something that is only an address.
+  if (code.indexOf("://") !== -1) return ""
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(code)) return ""
+  return code
+}
+
+// --- peer filtering ---------------------------------------------------------
+
+// Every token must match somewhere in the peer, so typing narrows rather than
+// widens. Fields searched are the ones on screen plus the transport, which is
+// the thing people actually hunt for ("which peers are relayed?").
+function peerHaystack(peer) {
+  if (!peer) return ""
+  return [peer.name, peer.fqdn, peer.ip, peer.connectionType, peer.status]
+    .map(function(value) { return String(value === undefined || value === null ? "" : value) })
+    .join(" ")
+    .toLowerCase()
+}
+
+function filterPeers(peers, query) {
+  var list = Array.isArray(peers) ? peers : []
+  var tokens = String(query === undefined || query === null ? "" : query)
+    .toLowerCase()
+    .split(/\s+/)
+    .filter(function(token) { return token !== "" })
+  if (tokens.length === 0) return list.slice()
+
+  var result = []
+  for (var i = 0; i < list.length; i++) {
+    var hay = peerHaystack(list[i])
+    var all = true
+    for (var t = 0; t < tokens.length; t++) {
+      if (hay.indexOf(tokens[t]) === -1) { all = false; break }
+    }
+    if (all) result.push(list[i])
+  }
+  return result
+}
+
+// Every call into the daemon is wrapped in `timeout`, because the CLI does not
+// give up on its own: with the daemon stopped, `netbird status` retries the
+// socket forever, printing gRPC warnings and never exiting. Measured on 0.77.1,
+// both for a missing unix socket and a refused TCP address.
+//
+// `-k` sends KILL that many seconds after the first TERM, for a CLI that
+// ignores TERM while inside a retry.
+var DAEMON_TIMEOUT_SEC = 8
+var DAEMON_KILL_GRACE_SEC = 2
+
+// `up` is the exception. With a valid session it returns in about a second, but
+// when SSO is needed it blocks for the whole browser round trip — an eight
+// second cap would kill exactly the flow the verification code exists for. Its
+// deadline sits just past the service's own 120 s login timer, so our timer
+// reports the failure and this only ever acts as the backstop.
+var LOGIN_TIMEOUT_SEC = 130
+var LOGIN_KILL_GRACE_SEC = 5
+
+function timeoutPrefix(seconds, graceSeconds) {
+  return ["timeout", "-k", String(graceSeconds), String(seconds)]
 }
 
 function upCommand() {
   // --no-browser keeps the URL on stdout instead of letting the CLI shell out
   // to a browser of its own, so the shell opens it with omarchy-launch-browser.
-  return ["netbird", "up", "--no-browser"]
+  return timeoutPrefix(LOGIN_TIMEOUT_SEC, LOGIN_KILL_GRACE_SEC).concat(["netbird", "up", "--no-browser"])
 }
 
 function downCommand() {
-  return ["netbird", "down"]
+  return timeoutPrefix(DAEMON_TIMEOUT_SEC, DAEMON_KILL_GRACE_SEC).concat(["netbird", "down"])
 }
 
 function statusCommand() {
-  return ["netbird", "status", "--json"]
+  return timeoutPrefix(DAEMON_TIMEOUT_SEC, DAEMON_KILL_GRACE_SEC).concat(["netbird", "status", "--json"])
+}
+
+// --- daemon reachability ----------------------------------------------------
+
+// `timeout` reports 124 when it fired, and 128+9 = 137 when the KILL after -k
+// was what finally ended the process.
+var TIMEOUT_EXIT = 124
+var TIMEOUT_KILL_EXIT = 137
+
+// A dial that failed against the daemon's own address. Deliberately anchored on
+// "dial <transport> <addr>: connect: <reason>" rather than on the words
+// "connection error", which a *healthy* daemon also prints — it appears in
+// ordinary peer-handshake chatter, and matching it would report a working
+// daemon as stopped whenever an unrelated call failed.
+var DAEMON_DIAL_FAILURE = /dial\s+(?:unix|tcp)\s+\S+:\s*connect:\s*(?:no such file or directory|connection refused|permission denied)/i
+var DAEMON_UNREACHABLE_PHRASE = /(?:failed to connect to (?:the )?daemon|daemon is not running|is the daemon running)/i
+
+// Did this invocation fail because the daemon is not there, as opposed to
+// failing for a reason the daemon itself reported?
+//
+// Two rules keep this from firing on a healthy daemon:
+//
+//   - A parseable status document on stdout settles it. The daemon answered,
+//     so it is running, whatever it had to say about a relay or a management
+//     endpoint it could not reach. Those errors are *quoted inside* the
+//     document — `relays.details[].error` is routinely a dial failure — and
+//     reading them as evidence about the daemon itself inverts their meaning.
+//   - Dial failures are matched on stderr only, never on stdout, for the same
+//     reason: on stdout that text is the daemon's report, not the CLI's.
+function daemonProbe(exitCode, stderr, stdout) {
+  var code = parseInt(String(exitCode), 10)
+
+  // The daemon spoke. Nothing else in here can outvote that.
+  if (findStatusJson(String(stdout || "").trim())) return { daemonDown: false, reason: "" }
+
+  if (code === TIMEOUT_EXIT || code === TIMEOUT_KILL_EXIT) {
+    return { daemonDown: true, reason: "timeout" }
+  }
+  var err = String(stderr || "")
+  if (DAEMON_DIAL_FAILURE.test(err) || DAEMON_UNREACHABLE_PHRASE.test(err)) {
+    return { daemonDown: true, reason: "unreachable" }
+  }
+  return { daemonDown: false, reason: "" }
+}
+
+// While the daemon is missing there is nothing to learn from polling at the
+// normal rate, and the shell pays for every process it starts. Back off
+// 5, 10, 20, 40, 60, 60 … and snap back to the configured interval on the
+// first poll that succeeds.
+var BACKOFF_BASE_SEC = 5
+var BACKOFF_CAP_SEC = 60
+
+// What the poll timer should be set to. While the daemon is missing the delay
+// widens, but it never drops below the interval the user configured — with the
+// default 30 s cadence a "backoff" of 5 s would poll a dead daemon six times
+// more often than a live one.
+function pollDelaySec(daemonDown, refreshIntervalSec, consecutiveFailures) {
+  var base = parseInt(String(refreshIntervalSec), 10)
+  if (!isFinite(base) || base < 1) base = 30
+  if (!daemonDown) return base
+  return Math.max(base, backoffDelaySec(consecutiveFailures))
+}
+
+function backoffDelaySec(consecutiveFailures) {
+  var n = parseInt(String(consecutiveFailures), 10)
+  if (!isFinite(n) || n < 1) n = 1
+  // 2^30 seconds is already past the cap; stop there so the shift cannot
+  // overflow into a negative delay on a long outage.
+  var steps = Math.min(n - 1, 30)
+  return Math.min(BACKOFF_CAP_SEC, BACKOFF_BASE_SEC * Math.pow(2, steps))
 }
 
 // One line describing the whole mesh, for the `status` IPC call.
@@ -574,6 +720,13 @@ if (typeof module !== "undefined") {
     parseStatus: parseStatus,
     extractAuthUrl: extractAuthUrl,
     loginProgress: loginProgress,
+    extractVerificationCode: extractVerificationCode,
+    filterPeers: filterPeers,
+    peerHaystack: peerHaystack,
+    daemonProbe: daemonProbe,
+    backoffDelaySec: backoffDelaySec,
+    pollDelaySec: pollDelaySec,
+    timeoutPrefix: timeoutPrefix,
     upCommand: upCommand,
     downCommand: downCommand,
     statusCommand: statusCommand,

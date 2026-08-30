@@ -650,11 +650,254 @@ test("extractAuthUrl only opens a browser for an actual login prompt", () => {
   assert.equal(Model.extractAuthUrl("", ""), "")
 })
 
+// --- daemon reachability ----------------------------------------------------
+
+// Verified against the real CLI: with the daemon socket gone, `netbird status`
+// never returns — it retries forever — so `timeout` firing is the signal.
+test("daemonProbe treats a timeout as the daemon being gone", () => {
+  assert.deepEqual(Model.daemonProbe(124, ""), { daemonDown: true, reason: "timeout" })
+  // 128+9: the KILL after `timeout -k` was what ended it.
+  assert.deepEqual(Model.daemonProbe(137, ""), { daemonDown: true, reason: "timeout" })
+  assert.equal(Model.daemonProbe("124", "").daemonDown, true)
+})
+
+test("daemonProbe recognises a failed dial to the daemon address", () => {
+  const unix = 'rpc error: dial unix /var/run/netbird.sock: connect: no such file or directory'
+  const refused = 'transport: Error while dialing: dial tcp 127.0.0.1:59999: connect: connection refused'
+  const denied = 'dial unix /var/run/netbird.sock: connect: permission denied'
+  for (const err of [unix, refused, denied]) {
+    assert.deepEqual(Model.daemonProbe(1, err), { daemonDown: true, reason: "unreachable" })
+  }
+  assert.equal(Model.daemonProbe(1, "is the daemon running?").daemonDown, true)
+  assert.equal(Model.daemonProbe(1, "failed to connect to daemon").daemonDown, true)
+  // The same phrases on stdout are the CLI's output, not a diagnosis of it.
+  assert.equal(Model.daemonProbe(1, "", "is the daemon running?").daemonDown, false)
+})
+
+// The trap a competing plugin fell into: matching the words "connection error"
+// anywhere. A healthy daemon prints them during ordinary peer handshakes, and
+// calling that "daemon down" backs the poll off and tells the user to restart a
+// service that is running fine.
+test("daemonProbe does not call a healthy daemon down", () => {
+  assert.deepEqual(Model.daemonProbe(0, ""), { daemonDown: false, reason: "" })
+  assert.equal(Model.daemonProbe(1, "peer reported a connection error during handshake").daemonDown, false)
+  assert.equal(Model.daemonProbe(1, "connection error: desc = transport is closing").daemonDown, false)
+  assert.equal(Model.daemonProbe(1, "context deadline exceeded").daemonDown, false)
+  assert.equal(Model.daemonProbe(2, "some other failure").daemonDown, false)
+})
+
+// A healthy daemon quotes dial failures inside its own JSON — an unreachable
+// relay lands in relays.details[].error. Reading those as evidence about the
+// daemon itself declared a working tunnel dead.
+test("daemonProbe never calls a daemon down that answered", () => {
+  const healthy = JSON.stringify({
+    daemonStatus: "Connected",
+    peers: { total: 1, connected: 1, details: [] },
+    management: { url: "https://netbird.example", connected: true, error: "" },
+    relays: { total: 1, available: 0, details: [{ uri: "rels://r", available: false, error: "dial tcp 1.2.3.4:443: connect: connection refused" }] }
+  })
+
+  assert.deepEqual(Model.daemonProbe(0, "", healthy), { daemonDown: false, reason: "" })
+  // Noise on stderr does not outvote a document on stdout either.
+  assert.deepEqual(Model.daemonProbe(0, "connection error: desc = transport is closing", healthy), { daemonDown: false, reason: "" })
+  assert.deepEqual(Model.daemonProbe(0, "dial unix /var/run/netbird.sock: connect: no such file or directory", healthy), { daemonDown: false, reason: "" })
+  // Management error quoted in the document is the daemon reporting, not the
+  // daemon missing.
+  const mgmtErr = JSON.stringify({ daemonStatus: "Connected", management: { connected: false, error: "dial tcp 10.0.0.1:443: connect: connection refused" } })
+  assert.equal(Model.daemonProbe(0, "", mgmtErr).daemonDown, false)
+})
+
+test("daemonProbe reads dial failures from stderr, not from stdout", () => {
+  const dial = "dial unix /var/run/netbird.sock: connect: no such file or directory"
+  // On stderr, with no document to contradict it: the daemon is missing.
+  assert.deepEqual(Model.daemonProbe(1, dial), { daemonDown: true, reason: "unreachable" })
+  // The same text arriving on stdout is output, not diagnosis.
+  assert.deepEqual(Model.daemonProbe(1, "", dial), { daemonDown: false, reason: "" })
+  // A timeout still wins when nothing parsed.
+  assert.deepEqual(Model.daemonProbe(124, "", ""), { daemonDown: true, reason: "timeout" })
+  // …but not over a document that did parse, which can only mean it answered.
+  assert.equal(Model.daemonProbe(124, "", '{"daemonStatus":"Connected"}').daemonDown, false)
+  // Non-status JSON is not an answer.
+  assert.equal(Model.daemonProbe(1, dial, '{"error":"permission denied"}').daemonDown, true)
+})
+
+// The literal stderr the CLI produced when pointed at a missing socket, kept
+// verbatim as a regression guard: this is the shape the matcher has to survive,
+// and it is dense with the words a looser matcher would trip on.
+const REAL_TIMEOUT_STDERR = "2026-08-30T11:17:10.390-07:00 INFO ./caller_not_available:0: 2026/08/30 11:17:10 WARNING: [core] [Channel #1 SubChannel #2] grpc: addrConn.createTransport failed to connect to {Addr: \"/tmp/nonexistent.sock\", ServerName: \"localhost\", Attributes: {\"<%!p(networktype.keyType=grpc.internal.transport.networktype)>\": \"unix\" }, }. Err: connection error: desc = \"transport: Error while dialing: dial unix /tmp/nonexistent.sock: connect: no such file or directory\"\n2026-08-30T11:17:11.391-07:00 INFO ./caller_not_available:0: 2026/08/30 11:17:11 WARNING: [core] [Channel #1 SubChannel #2] grpc: addrConn.createTransport failed to connect to {Addr: \"/tmp/nonexistent.sock\", ServerName: \"localhost\", Attributes"
+
+test("the stderr a real missing-socket run produced maps to daemon down", () => {
+  // As it actually happened: timeout fired, so the exit code alone settles it.
+  assert.deepEqual(Model.daemonProbe(124, REAL_TIMEOUT_STDERR, ""), { daemonDown: true, reason: "timeout" })
+  // And on its own merits, without the timeout exit, the dial failure is there.
+  assert.deepEqual(Model.daemonProbe(1, REAL_TIMEOUT_STDERR, ""), { daemonDown: true, reason: "unreachable" })
+  // It contains "connection error", which must not be what decided it.
+  assert.ok(/connection error/i.test(REAL_TIMEOUT_STDERR))
+  assert.equal(Model.daemonProbe(1, "connection error: desc = whatever").daemonDown, false)
+  // Even this, behind a document, is a daemon that answered.
+  assert.equal(Model.daemonProbe(1, REAL_TIMEOUT_STDERR, '{"daemonStatus":"Connected"}').daemonDown, false)
+})
+
+test("the poll cadence widens while down and snaps back on recovery", () => {
+  const interval = 30
+  // Five failing polls in a row at the default cadence.
+  const whileDown = [1, 2, 3, 4, 5].map((n) => Model.pollDelaySec(true, interval, n))
+  assert.deepEqual(whileDown, [30, 30, 30, 40, 60])
+  // Never below the healthy cadence, and never above the cap.
+  for (const d of whileDown) {
+    assert.ok(d >= interval)
+    assert.ok(d <= 60)
+  }
+  // Monotonic: a longer outage never polls more eagerly than a shorter one.
+  for (let i = 1; i < whileDown.length; i++) assert.ok(whileDown[i] >= whileDown[i - 1])
+  // The first good poll clears the counter, and the cadence is the plain
+  // interval again — not a lingering 60.
+  assert.equal(Model.pollDelaySec(false, interval, 0), interval)
+  assert.equal(Model.pollDelaySec(false, interval, 5), interval)
+})
+
+// Backing off must never mean polling a dead daemon more often than a live one.
+test("pollDelaySec never dips below the configured cadence", () => {
+  assert.deepEqual([1, 2, 3, 4, 5, 6].map((n) => Model.pollDelaySec(true, 30, n)), [30, 30, 30, 40, 60, 60])
+  // At the 5 s floor the backoff is free to start at its own first step.
+  assert.deepEqual([1, 2, 3, 4, 5].map((n) => Model.pollDelaySec(true, 5, n)), [5, 10, 20, 40, 60])
+  // A slower cadence than the cap stays put throughout.
+  assert.deepEqual([1, 5, 99].map((n) => Model.pollDelaySec(true, 300, n)), [300, 300, 300])
+  // Healthy: always the configured interval, whatever the failure count says.
+  for (const n of [0, 1, 99]) assert.equal(Model.pollDelaySec(false, 30, n), 30)
+  // Nonsense intervals fall back to the default rather than to zero.
+  for (const bad of [0, -1, undefined, null, "x"]) {
+    assert.equal(Model.pollDelaySec(false, bad, 1), 30)
+    assert.ok(Model.pollDelaySec(true, bad, 1) >= 30)
+  }
+})
+
+test("backoffDelaySec doubles to a cap and never runs backwards", () => {
+  assert.deepEqual([1, 2, 3, 4, 5, 6].map(Model.backoffDelaySec), [5, 10, 20, 40, 60, 60])
+  // Out-of-range and nonsense inputs land on the first step, not on zero.
+  for (const bad of [0, -3, undefined, null, "x", NaN]) {
+    assert.equal(Model.backoffDelaySec(bad), 5)
+  }
+  // A long outage must not overflow the shift into something small or negative.
+  for (const n of [40, 200, 100000]) {
+    assert.equal(Model.backoffDelaySec(n), 60)
+  }
+})
+
+// --- verification code ------------------------------------------------------
+
+test("extractVerificationCode reads the sentence the CLI actually prints", () => {
+  assert.equal(Model.extractVerificationCode("and enter the code ABCD-EFGH to authenticate."), "ABCD-EFGH")
+  assert.equal(Model.extractVerificationCode("Enter the code WXYZ1234 to authenticate"), "WXYZ1234")
+  assert.equal(Model.extractVerificationCode("...and enter the code   K7P-2QM   to authenticate."), "K7P-2QM")
+  assert.equal(Model.extractVerificationCode(""), "")
+  assert.equal(Model.extractVerificationCode(null), "")
+})
+
+test("extractVerificationCode ignores addresses and URLs", () => {
+  // No sentence at all — nothing to take.
+  assert.equal(Model.extractVerificationCode("https://idp.example/activate?user_code=ABCD-EFGH"), "")
+  assert.equal(Model.extractVerificationCode("connected to 100.64.0.9"), "")
+  // The sentence, but with something that is not a code where the code goes.
+  assert.equal(Model.extractVerificationCode("enter the code https://idp.example/x to authenticate"), "")
+  assert.equal(Model.extractVerificationCode("enter the code 10.0.0.1 to authenticate"), "")
+  assert.equal(Model.extractVerificationCode("enter the code ab to authenticate"), "")
+})
+
+test("loginProgress surfaces the code line by line and keeps showing it", () => {
+  const lines = [
+    "Please do the SSO login in your browser.",
+    "If your browser didn't open automatically, use this URL to log in:",
+    "",
+    "https://idp.example/activate",
+    "",
+    "and enter the code ABCD-EFGH to authenticate.",
+    "Waiting for authentication…"
+  ]
+  let buffer = ""
+  const seen = []
+  for (const line of lines) {
+    const progress = Model.loginProgress(buffer, line, "https://netbird.example:443")
+    buffer = progress.buffer
+    seen.push({ url: progress.url, code: progress.code })
+  }
+
+  // The URL is reported once, on the line that completed the prompt.
+  assert.equal(seen.filter((s) => s.url !== "").length, 1)
+  assert.equal(seen[3].url, "https://idp.example/activate")
+  // The code appears when its line arrives and keeps being reported after,
+  // because it is displayed for the life of the login rather than acted on.
+  assert.deepEqual(seen.slice(0, 5).map((s) => s.code), ["", "", "", "", ""])
+  assert.equal(seen[5].code, "ABCD-EFGH")
+  assert.equal(seen[6].code, "ABCD-EFGH")
+})
+
+// --- peer filtering ---------------------------------------------------------
+
+const FILTER_PEERS = [
+  { name: "atlas", fqdn: "atlas.netbird.example", ip: "100.64.12.5", connectionType: "P2P", status: "Connected" },
+  { name: "builder", fqdn: "builder.netbird.example", ip: "100.70.4.16", connectionType: "Relayed", status: "Connecting" },
+  { name: "desktop-oslo", fqdn: "desktop-oslo.netbird.example", ip: "100.64.31.88", connectionType: "", status: "Idle" },
+  { name: "phone-ada", fqdn: "phone-ada.netbird.example", ip: "100.99.7.201", connectionType: "", status: "Disconnected" }
+]
+const names = (list) => list.map((p) => p.name)
+
+test("filterPeers returns everything for an empty query", () => {
+  for (const q of ["", "   ", undefined, null]) {
+    assert.deepEqual(names(Model.filterPeers(FILTER_PEERS, q)), ["atlas", "builder", "desktop-oslo", "phone-ada"])
+  }
+  // A copy, not the caller's array.
+  const out = Model.filterPeers(FILTER_PEERS, "")
+  out.pop()
+  assert.equal(FILTER_PEERS.length, 4)
+  assert.deepEqual(Model.filterPeers(null, "x"), [])
+})
+
+test("filterPeers matches name, fqdn, address, transport and state", () => {
+  assert.deepEqual(names(Model.filterPeers(FILTER_PEERS, "atlas")), ["atlas"])
+  assert.deepEqual(names(Model.filterPeers(FILTER_PEERS, "netbird.example")).length, 4)
+  assert.deepEqual(names(Model.filterPeers(FILTER_PEERS, "relayed")), ["builder"])
+  assert.deepEqual(names(Model.filterPeers(FILTER_PEERS, "idle")), ["desktop-oslo"])
+  // An address prefix is the way you actually hunt for a peer.
+  assert.deepEqual(names(Model.filterPeers(FILTER_PEERS, "100.64.")), ["atlas", "desktop-oslo"])
+  assert.deepEqual(names(Model.filterPeers(FILTER_PEERS, "100.99.7.201")), ["phone-ada"])
+})
+
+test("filterPeers is case-insensitive and ANDs its tokens", () => {
+  assert.deepEqual(names(Model.filterPeers(FILTER_PEERS, "ATLAS")), ["atlas"])
+  assert.deepEqual(names(Model.filterPeers(FILTER_PEERS, "P2p")), ["atlas"])
+  // Both tokens must hit the same peer.
+  assert.deepEqual(names(Model.filterPeers(FILTER_PEERS, "builder relayed")), ["builder"])
+  assert.deepEqual(names(Model.filterPeers(FILTER_PEERS, "atlas relayed")), [])
+  assert.deepEqual(names(Model.filterPeers(FILTER_PEERS, "  100.64.   connected  ")), ["atlas"])
+  assert.deepEqual(names(Model.filterPeers(FILTER_PEERS, "nothingmatches")), [])
+})
+
+test("filterPeers survives malformed peers", () => {
+  const messy = [null, undefined, {}, { name: "ok" }]
+  assert.doesNotThrow(() => Model.filterPeers(messy, "ok"))
+  assert.deepEqual(Model.filterPeers(messy, "ok").length, 1)
+  assert.equal(Model.peerHaystack(null), "")
+  // Absent fields collapse to empty, so the haystack has runs of spaces. That
+  // is harmless: tokens are split on whitespace and so never contain one.
+  const hay = Model.peerHaystack({ name: "A", ip: "1.2.3.4" })
+  assert.equal(hay.includes("a"), true)
+  assert.equal(hay.includes("1.2.3.4"), true)
+  assert.equal(hay, hay.toLowerCase())
+  assert.deepEqual(Model.filterPeers([{ name: "A", ip: "1.2.3.4" }], "a 1.2.3.4").length, 1)
+})
+
 test("commands are the exact argv vectors the service runs", () => {
-  assert.deepEqual(Model.statusCommand(), ["netbird", "status", "--json"])
-  assert.deepEqual(Model.downCommand(), ["netbird", "down"])
+  // Every daemon call is timeout-wrapped: with the socket gone the CLI retries
+  // forever rather than exiting, so without this a poll simply never returns.
+  assert.deepEqual(Model.statusCommand(), ["timeout", "-k", "2", "8", "netbird", "status", "--json"])
+  assert.deepEqual(Model.downCommand(), ["timeout", "-k", "2", "8", "netbird", "down"])
+  // `up` gets a much longer deadline on purpose: it blocks for the whole SSO
+  // round trip, and an eight-second cap would kill the login it is there for.
   // --no-browser keeps the SSO URL on stdout so the shell opens it itself.
-  assert.deepEqual(Model.upCommand(), ["netbird", "up", "--no-browser"])
+  assert.deepEqual(Model.upCommand(), ["timeout", "-k", "5", "130", "netbird", "up", "--no-browser"])
+  assert.ok(Number(Model.upCommand()[3]) > Number(Model.statusCommand()[3]))
+  assert.deepEqual(Model.timeoutPrefix(8, 2), ["timeout", "-k", "2", "8"])
 })
 
 test("summaryLine is what the status IPC call answers with", () => {

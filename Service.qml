@@ -43,6 +43,19 @@ Item {
   property string daemonVersion: ""
   property bool degraded: false
   property string degradedText: ""
+  // The CLI is present but the daemon behind it is not answering. Distinct
+  // from `disconnected`, which means a daemon that answered and said it is off.
+  property bool daemonDown: false
+  property string daemonDownReason: ""
+  // The device code from an SSO login in flight, shown until the login ends.
+  property string loginCode: ""
+  // True for the whole life of `netbird up`. `_loginInProgress` is cleared the
+  // moment the browser opens, so it cannot be what a Cancel affordance is
+  // gated on: a URL-only login would leave the process running with no way to
+  // stop it. Quickshell terminating this Process signals `timeout`, which
+  // forwards to its direct child — verified: TERM to `timeout` takes `netbird`
+  // with it, since we exec it directly rather than through a shell.
+  readonly property bool loginActive: loginProcess.running
   property var peers: []
   property string actionStatus: ""
   property string lastError: ""
@@ -52,14 +65,12 @@ Item {
   // slow-but-healthy `netbird status` is never mistaken for a hung one.
   readonly property int pollTimeoutSec: Math.max(15, refreshIntervalSec * 3)
   readonly property bool busy: whichProcess.running || statusProcess.running || actionProcess.running || loginProcess.running
+  // While the daemon is missing there is nothing to poll for; back off instead
+  // of starting a process every few seconds inside the shared shell process.
+  readonly property int pollIntervalSec: Model.pollDelaySec(daemonDown, refreshIntervalSec, _consecutiveDaemonFailures)
   readonly property string peerCountText: peersTotal > 0 || running ? String(peersConnected) + "/" + String(peersTotal) : ""
 
-  property string _statusOutput: ""
-  property string _statusError: ""
-  property string _actionOutput: ""
-  property string _actionError: ""
-  property string _loginOutput: ""
-  property string _loginError: ""
+  property int _consecutiveDaemonFailures: 0
   property bool _loginInProgress: false
   property bool _loginUrlOpened: false
   // Every line `netbird up` has printed so far, stdout and stderr interleaved
@@ -120,8 +131,6 @@ Item {
 
   function refreshStatus() {
     if (!installed || statusProcess.running) return
-    _statusOutput = ""
-    _statusError = ""
     refreshing = true
     statusProcess.command = Model.statusCommand()
     statusProcess.running = true
@@ -134,6 +143,24 @@ Item {
   function elideStatus(text) {
     var value = String(text || "").replace(/\s+/g, " ").trim()
     return value.length > 140 ? value.substring(0, 137) + "…" : value
+  }
+
+  // The daemon did not answer. Keep saying so, clear everything that came from
+  // it, and let the caller's backoff widen — showing the last good peer list
+  // next to "daemon is not running" would be worse than showing nothing.
+  function enterDaemonDown(reason) {
+    _consecutiveDaemonFailures += 1
+    daemonDown = true
+    daemonDownReason = String(reason || "")
+    resetUnavailable("Daemon not running")
+    lastError = ""
+  }
+
+  function clearDaemonDown() {
+    if (!daemonDown && _consecutiveDaemonFailures === 0) return
+    daemonDown = false
+    daemonDownReason = ""
+    _consecutiveDaemonFailures = 0
   }
 
   function resetUnavailable(message) {
@@ -207,6 +234,7 @@ Item {
 
     if (running) {
       _loginInProgress = false
+      loginCode = ""
       loginTimeoutTimer.stop()
     }
     // `_loginUrlOpened` is deliberately NOT cleared here. It is owned by the
@@ -218,6 +246,7 @@ Item {
   }
 
   function summary() {
+    if (daemonDown) return "Daemon not running"
     return Model.summaryLine({
       unavailable: !installed || daemonStatus === "Unavailable",
       statusText: statusText,
@@ -238,12 +267,12 @@ Item {
   // during a pending login, which cancels the login and proceeds — a user
   // saying "off" outranks an SSO flow that otherwise blocks for minutes.
   function toggleNetbird() {
-    if (!installed) return false
+    if (!installed || daemonDown) return false
     return active ? down() : up()
   }
 
   function down() {
-    if (!installed) return false
+    if (!installed || daemonDown) return false
     // "Off" wins over a login still waiting on a browser.
     if (loginProcess.running) cancelLogin()
     if (actionProcess.running) return false
@@ -256,11 +285,10 @@ Item {
   }
 
   function up() {
-    if (!installed || actionProcess.running || loginProcess.running) return false
-    _loginOutput = ""
-    _loginError = ""
+    if (!installed || daemonDown || actionProcess.running || loginProcess.running) return false
     _loginBuffer = ""
     _loginUrlOpened = false
+    loginCode = ""
     // `_loginCancelled` is deliberately not cleared here: it belongs to the
     // process that was cancelled, and only that process's exit handler may
     // consume it. Clearing it would make a cancelled login report a failure
@@ -289,14 +317,13 @@ Item {
     _loginInProgress = false
     _loginUrlOpened = false
     _loginBuffer = ""
+    loginCode = ""
     loginTimeoutTimer.stop()
     loginHardTimeout.stop()
   }
 
   function runAction(command, label) {
     if (actionProcess.running) return
-    _actionOutput = ""
-    _actionError = ""
     actionStatus = label || ""
     actionProcess.command = command
     actionProcess.running = true
@@ -327,16 +354,15 @@ Item {
     // of it may reopen a flow the user just called off.
     if (_loginCancelled) return
     var text = String(data === undefined || data === null ? "" : data)
-    if (isError) _loginError += text + "\n"
-    else _loginOutput += text + "\n"
     var progress = Model.loginProgress(_loginBuffer, text, managementUrl)
     _loginBuffer = progress.buffer
+    if (progress.code !== "") loginCode = progress.code
     if (!_loginUrlOpened) openAuthUrl(progress.url)
   }
 
   Timer {
     id: refreshTimer
-    interval: root.refreshIntervalSec * 1000
+    interval: root.pollIntervalSec * 1000
     repeat: true
     running: true
     triggeredOnStart: true
@@ -354,7 +380,9 @@ Item {
     running: true
     onTriggered: {
       ticks += 1
-      if (root.running || ticks >= 15) startupRamp.running = false
+      // Stop the moment the tunnel is up, the budget runs out, or the daemon
+      // turns out to be missing — the backoff owns the cadence from there.
+      if (root.running || root.daemonDown || ticks >= 15) startupRamp.running = false
       else root.refresh()
     }
   }
@@ -464,26 +492,53 @@ Item {
     id: statusProcess
     running: false
     command: []
-    stdout: StdioCollector { id: statusStdout; waitForEnd: true; onStreamFinished: root._statusOutput = text }
-    stderr: StdioCollector { id: statusStderr; waitForEnd: true; onStreamFinished: root._statusError = text }
+    stdout: BoundedCollector { id: statusStdout; limit: 262144 }
+    stderr: BoundedCollector { id: statusStderr; limit: 262144 }
     onExited: function(exitCode) {
       // First, before anything can return: this deadline belongs to the poll
       // that just ended and must not outlive it.
       pollWatchdog.stop()
       root.refreshing = false
+      var stdout = String(statusStdout.tail || "")
+      var stderr = String(statusStderr.tail || "")
+
       if (root._watchdogReaped) {
-        // Our own watchdog ended this poll. The daemon has not told us
-        // anything, so every field keeps the value the last good poll gave it.
+        // Our own watchdog ended this poll — now only a backstop, since the
+        // argv carries its own `timeout`. Treat it the same as that timeout:
+        // the daemon told us nothing, and saying nothing is what went wrong
+        // before, leaving a stale "Connected" on screen for as long as the
+        // daemon stayed down.
         root._watchdogReaped = false
         console.warn("netbird status refresh timed out after", root.pollTimeoutSec, "seconds")
+        root.enterDaemonDown("timeout")
         return
       }
-      var stdout = String(statusStdout.text || root._statusOutput || "")
-      var stderr = String(statusStderr.text || root._statusError || "")
-      if (exitCode === 0) {
+
+      // A clean exit carrying a real status document needs no adjudication:
+      // the daemon answered. Asking the probe first was a bug — a healthy
+      // daemon quotes dial failures inside its own JSON (an unreachable relay
+      // in `relays.details[].error`), and reading those as evidence about the
+      // daemon itself declared a working tunnel dead.
+      var parsed = exitCode === 0 ? Model.parseStatus(stdout, Date.now()) : null
+      if (parsed && parsed.ok && !parsed.unavailable) {
+        root.clearDaemonDown()
         root.parseStatus(stdout)
         return
       }
+
+      // No usable answer. Now it is worth asking whether anything was there.
+      var probe = Model.daemonProbe(exitCode, stderr, stdout)
+      if (probe.daemonDown) {
+        root.enterDaemonDown(probe.reason)
+        return
+      }
+
+      if (exitCode === 0) {
+        root.clearDaemonDown()
+        root.parseStatus(stdout)
+        return
+      }
+      root.clearDaemonDown()
       // A non-zero exit that still printed a whole status document knows more
       // than "Disconnected" does — a NeedsLogin or degraded daemon can exit
       // non-zero and say so in stdout. `Model.parseStatus` now refuses JSON
@@ -507,11 +562,11 @@ Item {
     id: actionProcess
     running: false
     command: []
-    stdout: StdioCollector { id: actionStdout; waitForEnd: true; onStreamFinished: root._actionOutput = text }
-    stderr: StdioCollector { id: actionStderr; waitForEnd: true; onStreamFinished: root._actionError = text }
+    stdout: BoundedCollector { id: actionStdout; limit: 16384 }
+    stderr: BoundedCollector { id: actionStderr; limit: 16384 }
     onExited: function(exitCode) {
-      var stdout = String(actionStdout.text || root._actionOutput || "")
-      var stderr = String(actionStderr.text || root._actionError || "")
+      var stdout = String(actionStdout.tail || "")
+      var stderr = String(actionStderr.tail || "")
       if (exitCode !== 0) {
         root._desired = -1
         root.lastError = root.elideStatus(stderr || stdout || "netbird command failed")
@@ -533,6 +588,7 @@ Item {
     stderr: SplitParser { onRead: function(data) { root.handleLoginOutput(data, true) } }
     onExited: function(exitCode) {
       loginHardTimeout.stop()
+      root.loginCode = ""
       if (root._loginCancelled) {
         // We ended this one — `down()` or the hard timeout. Its exit code says
         // nothing about the user's request, so report nothing.
