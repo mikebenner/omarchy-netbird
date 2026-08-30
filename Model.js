@@ -871,6 +871,39 @@ function networkDetail(network) {
   return domains.join(", ")
 }
 
+// --- bounded text retention -------------------------------------------------
+
+// Keep at most `limit` UTF-16 code units of `text`, dropping from the front.
+// Whole lines go first, so a code point cannot be cut — a code point never
+// straddles a "\n". The exception is a single line longer than the whole
+// budget, where there is no line boundary to land on; there the cut is nudged
+// forward off a low surrogate so the result never begins with half a pair.
+function trimToLimit(text, limit) {
+  var value = String(text === undefined || text === null ? "" : text)
+  var cap = parseInt(String(limit), 10)
+  if (!isFinite(cap) || cap < 0) return value
+  if (value.length <= cap) return value
+
+  var cut = 0
+  while (value.length - cut > cap) {
+    var nl = value.indexOf("\n", cut)
+    if (nl === -1) {
+      cut = value.length - cap
+      break
+    }
+    cut = nl + 1
+  }
+
+  // A low surrogate here means the cut landed inside a pair; step past it.
+  // Costs one code unit and keeps the string well formed.
+  if (cut < value.length) {
+    var code = value.charCodeAt(cut)
+    if (code >= 0xDC00 && code <= 0xDFFF) cut += 1
+  }
+
+  return value.substring(cut)
+}
+
 // --- networks read/write ordering -------------------------------------------
 //
 // A list read is only trustworthy if no write happened between its start and
@@ -901,18 +934,25 @@ function shouldApplyNetworksRead(capturedCompletions, currentCompletions, writeI
 // The header is required. Without it we are looking at a warning, an error, or
 // a future format — and turning arbitrary lines into profiles would put rows in
 // the switcher that run `netbird profile select <that line>` when clicked.
-var PROFILE_HEADER = /^\s*NAME\s+ACTIVE\s*$/
-// Profile names are filesystem-ish identifiers; anything else is not a row.
-var PROFILE_NAME = /^[A-Za-z0-9][A-Za-z0-9._@-]*$/
-var PROFILE_ACTIVE_MARKS = ["✓", "*", "yes", "true", "active"]
+var PROFILE_HEADER = /^(\s*)NAME(\s+)ACTIVE\s*$/
 
+// Read by the header's column geometry, not by splitting on whitespace.
+// Profile names are free-form — `Work Account` and `büro` are both legal — so
+// taking the first whitespace-delimited token truncated one and dropped the
+// other. The ACTIVE column starts at a fixed offset the header itself declares;
+// everything left of it is the name.
 function parseProfileList(raw) {
   var text = String(raw === undefined || raw === null ? "" : raw)
   var lines = text.split(/\r?\n/)
 
   var headerAt = -1
+  var activeAt = -1
   for (var i = 0; i < lines.length; i++) {
-    if (PROFILE_HEADER.test(lines[i])) { headerAt = i; break }
+    var header = lines[i].match(PROFILE_HEADER)
+    if (!header) continue
+    headerAt = i
+    activeAt = header[1].length + "NAME".length + header[2].length
+    break
   }
   if (headerAt === -1) return []
 
@@ -920,15 +960,20 @@ function parseProfileList(raw) {
   for (var j = headerAt + 1; j < lines.length; j++) {
     var line = lines[j]
     if (line.trim() === "") continue
-    var parts = line.trim().split(/\s+/)
-    var name = parts[0]
-    if (!PROFILE_NAME.test(name)) continue
-    var mark = (parts[1] || "").toLowerCase()
-    var active = false
-    for (var m = 0; m < PROFILE_ACTIVE_MARKS.length; m++) {
-      if (mark === PROFILE_ACTIVE_MARKS[m]) { active = true; break }
-    }
-    profiles.push({ name: name, active: active })
+    // A row has to reach the ACTIVE column to be a row at all. A trailing
+    // "WARNING failed to read cache" is shorter than the table is wide, so it
+    // is discarded rather than becoming a selectable profile.
+    if (line.length < activeAt) continue
+    var namePart = line.substring(0, activeAt)
+    // The name column is padded, so a real row always has whitespace where the
+    // ACTIVE column begins. That single check is what separates a row from a
+    // trailing "WARNING failed to read cache", whose words run straight
+    // through the column boundary.
+    if (!/\s$/.test(namePart)) continue
+    var name = namePart.replace(/\s+$/, "")
+    if (name === "" || /^\s/.test(name)) continue
+    var cell = line.substring(activeAt).trim()
+    profiles.push({ name: name, active: cell !== "" })
   }
   return profiles
 }
@@ -959,12 +1004,20 @@ function pingCommand(address) {
 //
 // Self-hosted deployments serve the dashboard from the management host itself,
 // so the management URL is the default. The explicit setting always wins.
+// NetBird Cloud serves its management API from api.netbird.io and its dashboard
+// from app.netbird.io, so the host cannot simply be reused there.
+var HOSTED_MANAGEMENT_HOST = "api.netbird.io"
+var HOSTED_CONSOLE_URL = "https://app.netbird.io"
+
 function adminConsoleUrl(managementUrl, override) {
   var explicit = String(override || "").trim()
   if (explicit !== "") return explicit
 
   var url = String(managementUrl || "").trim()
   if (url === "") return ""
+
+  // Hosted NetBird, on any port.
+  if (hostKey(url) === HOSTED_MANAGEMENT_HOST) return HOSTED_CONSOLE_URL
 
   var schemeMatch = url.match(/^([a-z][a-z0-9+.-]*):\/\//i)
   var scheme = schemeMatch ? schemeMatch[1].toLowerCase() : "https"
@@ -1096,6 +1149,7 @@ if (typeof module !== "undefined") {
     isStatusDocument: isStatusDocument,
     hostKey: hostKey,
     trimUrlPunctuation: trimUrlPunctuation,
+    trimToLimit: trimToLimit,
     parseStatus: parseStatus,
     extractAuthUrl: extractAuthUrl,
     loginProgress: loginProgress,

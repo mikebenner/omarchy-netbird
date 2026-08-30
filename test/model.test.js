@@ -1055,31 +1055,72 @@ test("relay details are parsed for the expandable relay list", () => {
 // Exactly the table `netbird profile list` prints on 0.77.1:
 //     NAME     ACTIVE
 //     default  ✓
+// The table Go's tabwriter emits: the NAME column is padded so the ACTIVE
+// column starts at a fixed offset the header itself declares.
+const PROFILE_TABLE = [
+  "NAME          ACTIVE",
+  "default       ",
+  "Work Account  ✓",
+  "büro          ",
+  ""
+].join("\n")
+
 test("parseProfileList reads the table and marks the active profile", () => {
+  // Exactly what this machine prints, with one profile.
   assert.deepEqual(Model.parseProfileList("NAME     ACTIVE\ndefault  ✓\n"), [{ name: "default", active: true }])
-  assert.deepEqual(Model.parseProfileList("NAME     ACTIVE\ndefault  ✓\nwork\npersonal\n"), [
-    { name: "default", active: true },
-    { name: "work", active: false },
-    { name: "personal", active: false }
+
+  // Profile names are free-form: spaces and non-ASCII must survive intact.
+  // Splitting on whitespace truncated "Work Account" and dropped "büro".
+  assert.deepEqual(Model.parseProfileList(PROFILE_TABLE), [
+    { name: "default", active: false },
+    { name: "Work Account", active: true },
+    { name: "büro", active: false }
   ])
-  // Names with the punctuation a profile may legitimately carry.
-  assert.deepEqual(Model.parseProfileList("NAME     ACTIVE\nwork.acme\nuser@host  ✓\n").map((p) => p.name), ["work.acme", "user@host"])
 })
 
-// The failure this guards against: without requiring the header, a CLI that
-// printed a warning instead of the table would put that warning in the
-// switcher as a row that runs `netbird profile select <warning>` when clicked.
 test("parseProfileList refuses anything that is not the table", () => {
-  assert.deepEqual(Model.parseProfileList("WARNING failed to open log file\ndefault  ✓\n"), [])
+  // No header: nothing is a row, however table-like it looks.
   assert.deepEqual(Model.parseProfileList("default  ✓\n"), [])
   for (const raw of ["", "   ", null, undefined, "no profiles"]) {
     assert.deepEqual(Model.parseProfileList(raw), [])
   }
-  // Header present but rows that are not plausible names are skipped.
-  const noisy = "NAME     ACTIVE\ndefault  ✓\n  -- not a name --\n/etc/passwd\n"
-  assert.deepEqual(Model.parseProfileList(noisy).map((p) => p.name), ["default"])
-  // A leading warning above a real table still parses, since the header anchors it.
-  assert.deepEqual(Model.parseProfileList("WARNING x\nNAME     ACTIVE\ndefault  ✓\n").map((p) => p.name), ["default"])
+
+  // A warning *before* the header still parses — the header anchors it.
+  assert.deepEqual(
+    Model.parseProfileList("WARNING failed to open log file\nNAME     ACTIVE\ndefault  ✓\n").map((p) => p.name),
+    ["default"]
+  )
+
+  // A warning *after* the table must not become a selectable profile: its
+  // words run straight through the column boundary instead of being padded.
+  const trailing = PROFILE_TABLE + "WARNING failed to read cache\n"
+  assert.deepEqual(Model.parseProfileList(trailing).map((p) => p.name), ["default", "Work Account", "büro"])
+
+  // A line too short to reach the ACTIVE column is not a row either.
+  assert.deepEqual(Model.parseProfileList("NAME          ACTIVE\nshort\n"), [])
+})
+
+// Free-form names and argv are a pair: the parser now returns names with
+// spaces and non-ASCII in them, so the command builder has to keep each one a
+// single argument. A name that round-trips through both is the real contract.
+test("a free-form profile name survives parse and stays one argument", () => {
+  const table = ["NAME          ACTIVE", "default       ✓", "Work Account  ", "büro          ", ""].join("\n")
+  const parsed = Model.parseProfileList(table)
+  assert.deepEqual(parsed.map((p) => p.name), ["default", "Work Account", "büro"])
+
+  for (const profile of parsed) {
+    const argv = Model.profileSelectCommand(profile.name)
+    // The name is exactly one element, unsplit and unescaped.
+    assert.equal(argv.length, 8)
+    assert.equal(argv[argv.length - 1], profile.name)
+    assert.deepEqual(argv.slice(0, 7), ["timeout", "-k", "2", "8", "netbird", "profile", "select"])
+  }
+
+  // And the same holds for a name carrying shell metacharacters.
+  const nasty = "prod; rm -rf ~ && echo"
+  const argv = Model.profileSelectCommand(nasty)
+  assert.equal(argv[argv.length - 1], nasty)
+  assert.equal(argv.length, 8)
 })
 
 test("profile commands are timeout-wrapped argv vectors", () => {
@@ -1201,6 +1242,118 @@ test("the verification code survives a line break and rejects a digest", () => {
   // The real shapes still work.
   assert.equal(Model.extractVerificationCode("and enter the code ABCD-EFGH to authenticate."), "ABCD-EFGH")
   assert.equal(Model.extractVerificationCode("enter the code K7P2QM9 to authenticate"), "K7P2QM9")
+})
+
+// --- bounded retention ------------------------------------------------------
+
+test("trimToLimit drops whole lines from the front", () => {
+  const text = "aaa\nbbb\nccc"
+  // Under the cap: untouched.
+  assert.equal(Model.trimToLimit(text, 100), text)
+  assert.equal(Model.trimToLimit(text, text.length), text)
+  // Over it: whole lines go, oldest first, and the result stays under the cap.
+  const trimmed = Model.trimToLimit(text, 7)
+  assert.equal(trimmed, "bbb\nccc")
+  assert.ok(trimmed.length <= 7)
+  assert.equal(Model.trimToLimit(text, 3), "ccc")
+  // Degenerate caps are survivable rather than throwing.
+  assert.equal(Model.trimToLimit("", 10), "")
+  assert.equal(Model.trimToLimit(null, 10), "")
+  for (const bad of [undefined, -1, "x"]) assert.equal(Model.trimToLimit("abc", bad), "abc")
+})
+
+// The reported defect: a single line longer than the whole budget has no line
+// boundary to land on, and the cut fell inside a surrogate pair.
+test("trimToLimit never leaves half a code point at the front", () => {
+  // "😀x" is three UTF-16 units: D83D DE00 78. A cut to the last 2 units used
+  // to start on the orphan low surrogate DE00.
+  const out = Model.trimToLimit("😀x", 2)
+  assert.ok(out.length > 0 ? !(out.charCodeAt(0) >= 0xDC00 && out.charCodeAt(0) <= 0xDFFF) : true,
+    "result begins with an orphan low surrogate")
+  assert.equal(out, "x")
+  // Whatever comes back must be well formed on its own.
+  assert.equal(out, Array.from(out).join(""))
+
+  // Four é are four units and stay whole characters at a cap of four.
+  assert.equal(Model.trimToLimit("éééé", 4), "éééé")
+  assert.equal(Array.from(Model.trimToLimit("éééé", 3)).length, 3)
+
+  // A long line of emoji trims to whole emoji, never to halves.
+  const emoji = "😀".repeat(10)
+  for (const cap of [1, 2, 3, 5, 9]) {
+    const cut = Model.trimToLimit(emoji, cap)
+    assert.equal(cut, Array.from(cut).join(""), `cap ${cap} split a pair`)
+    assert.ok(cut.length <= cap, `cap ${cap} exceeded`)
+  }
+})
+
+// --- networks ordering, replaying the reported interleaving -----------------
+
+test("a networks read that loses its race is always detectable", () => {
+  // The reported sequence: a read starts, a write begins and finishes while it
+  // is out, the write's retry is refused because the read is still running,
+  // and the read finally exits.
+  let completions = 0
+  const readCaptured = completions      // read starts: captures 0
+
+  // A write begins while that read is in flight...
+  const duringWrite = Model.canStartNetworksRead(true, true)
+  assert.equal(duringWrite, false, "a read must not start across a write")
+
+  // ...and finishes.
+  completions += 1
+
+  // The old read now exits. It must be rejected on both counts: the completion
+  // it captured is stale, and it would be rejected even if it were not.
+  assert.equal(Model.shouldApplyNetworksRead(readCaptured, completions, false), false)
+  assert.equal(Model.shouldApplyNetworksRead(readCaptured, readCaptured, true), false)
+
+  // Once everything is quiet a fresh read may start, and its own result — with
+  // nothing having happened in between — applies.
+  assert.equal(Model.canStartNetworksRead(false, false), true)
+  const freshCaptured = completions
+  assert.equal(Model.shouldApplyNetworksRead(freshCaptured, completions, false), true)
+})
+
+// --- admin console ----------------------------------------------------------
+
+test("adminConsoleUrl knows NetBird Cloud serves its dashboard elsewhere", () => {
+  // Cloud's management API and its dashboard are different hosts, so reusing
+  // the management host sent people to the API.
+  assert.equal(Model.adminConsoleUrl("https://api.netbird.io:443", ""), "https://app.netbird.io")
+  assert.equal(Model.adminConsoleUrl("https://api.netbird.io", ""), "https://app.netbird.io")
+  assert.equal(Model.adminConsoleUrl("https://api.netbird.io:8443", ""), "https://app.netbird.io")
+  assert.equal(Model.adminConsoleUrl("https://API.NetBird.IO:443", ""), "https://app.netbird.io")
+  // An explicit setting still wins, even for Cloud.
+  assert.equal(Model.adminConsoleUrl("https://api.netbird.io:443", "https://console.example"), "https://console.example")
+  // Self-hosted is unchanged: the management host is the dashboard host.
+  assert.equal(Model.adminConsoleUrl("https://netbird.example:443", ""), "https://netbird.example")
+  assert.equal(Model.adminConsoleUrl("https://[2001:db8::1]:443", ""), "https://[2001:db8::1]")
+  // A lookalike host is not Cloud.
+  assert.equal(Model.adminConsoleUrl("https://api.netbird.io.example:443", ""), "https://api.netbird.io.example")
+})
+
+// --- documentation ----------------------------------------------------------
+
+// The README has drifted from the code twice now, in ways a reader would act
+// on. These are the specific claims worth pinning.
+test("the README describes the widget that actually ships", () => {
+  const readme = fs.readFileSync(path.join(__dirname, "..", "README.md"), "utf8")
+
+  // Profile switching ships; it must not be listed as dropped.
+  const dropped = readme.slice(readme.indexOf("## What was dropped"))
+  assert.ok(!/profile switching/i.test(dropped.split("##")[1] || ""),
+    "README still lists profile switching as dropped")
+  assert.ok(readme.includes("## Profiles"), "the PROFILES feature is undocumented")
+
+  // Every setting in the manifest appears in the settings table.
+  const m = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "manifest.json"), "utf8"))
+  for (const entry of m.barWidget.schema) {
+    assert.ok(readme.includes("`" + entry.key + "`"), `README does not document the ${entry.key} setting`)
+  }
+
+  // The backoff claim must not promise a cadence faster than the code allows.
+  assert.ok(!/backs off 5 s/.test(readme), "README still claims the raw 5 s backoff")
 })
 
 test("commands are the exact argv vectors the service runs", () => {

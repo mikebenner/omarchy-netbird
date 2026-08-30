@@ -258,12 +258,16 @@ sign-in flow is the same one described above.
 
 ## Admin console
 
-`a`, or the button in the PEERS header, opens the admin console. By default the
-URL is derived from the management URL — right for most self-hosted
-deployments, where the dashboard is served from the management host. Set
-`adminConsoleUrl` explicitly for NetBird Cloud (`https://app.netbird.io`) or a
-split dashboard host. Only the default `:443` is dropped when deriving; a
-management URL on another port keeps it.
+`a`, or the button in the PEERS header, opens the admin console. The URL is
+derived from the management URL, which is right for most self-hosted
+deployments, where the dashboard is served from the management host. NetBird
+Cloud is recognised as a special case — a management host of `api.netbird.io`
+maps to `https://app.netbird.io`, because Cloud serves its API and its
+dashboard from different hosts — so it needs no configuration either.
+
+Set `adminConsoleUrl` explicitly only for a split dashboard host of your own.
+Only the default `:443` is dropped when deriving; a management URL on another
+port keeps it.
 
 ## When the daemon is not running
 
@@ -310,8 +314,7 @@ Two deliberate edges in the parsing, both chosen over guessing:
 ## What was dropped from the Tailscale widget
 
 NetBird has no analogue for these, so they are simply gone: exit nodes,
-Mullvad regions, account/profile switching, Taildrop file sending, and the
-operator authorization row.
+Mullvad regions, Taildrop file sending, and the operator authorization row.
 
 ## Tests
 

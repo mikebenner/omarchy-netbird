@@ -356,6 +356,7 @@ Panel {
     if (panelFlick) panelFlick.contentY = 0
     netbird.refresh()
     netbird.refreshNetworks()
+    netbird.refreshProfiles()
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
   onPeerIndexChanged: scrollCursorIntoView()

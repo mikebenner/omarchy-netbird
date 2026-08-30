@@ -1,40 +1,45 @@
 import QtQuick
 import Quickshell.Io
+import "Model.js" as Model
 
 // A process-output collector whose memory is bounded *while* collecting, and
 // whose result is complete by the time `Process.exited` runs.
 //
-// Getting both at once
-// --------------------
-// `StdioCollector` guarantees completeness (`waitForEnd`) but keeps the entire
-// stream: wrapping it and trimming a derived value bounds only what downstream
-// reads, so a high-rate producer still grows the shell's heap for as long as it
-// runs. `SplitParser` delivers incrementally — so a cap can be applied as the
-// data arrives — but exposes no completeness signal.
+// Completeness — settled from the quickshell source, not assumed
+// -------------------------------------------------------------
+// quickshell v0.3.1 (the installed version), `src/io/process.cpp`,
+// `Process::onFinished` at lines 274-286:
 //
-// This takes the incremental route and supplies the missing guarantee itself:
-// `Process.exited` is emitted after the process's streams are closed and their
-// pending `read` callbacks have been delivered, so `tail` is final when the
-// exit handler runs. The proof that matters in practice is the one this widget
-// depends on: the SSO flow has always read `_loginBuffer`, assembled from
-// exactly these `SplitParser` deliveries, inside `loginProcess.onExited`, and
-// the URL and code it needs are on the *last* lines the CLI writes.
+//     if (this->mStdoutParser) this->mStdoutParser->streamEnded(this->stdoutBuffer);
+//     if (this->mStderrParser) this->mStderrParser->streamEnded(this->stderrBuffer);
+//     ...
+//     emit this->exited(exitCode, exitStatus);
 //
-// Belt and braces, because "the last line arrived" is the whole contract: a
-// caller that must not mis-read a truncated document should treat an empty
-// `tail` on a zero exit as "no answer" rather than as an empty answer — which
-// is what `Model.parseStatus` already does.
+// and `src/io/datastream.cpp`, `SplitParser::streamEnded` at lines 101-103:
+//
+//     if (!buffer.isEmpty()) emit this->read(QString(buffer));
+//
+// So every whole line has already been delivered by `parseBytes` as it
+// arrived, the trailing partial line is flushed by `streamEnded`, and only
+// then is `exited` emitted. A `SplitParser` therefore *has* a completeness
+// guarantee — it is expressed as ordering rather than as a signal, which is
+// why the type carries no `waitForEnd`. `tail` is final in the exit handler.
+//
+// That settles the question that made an earlier revision fall back to
+// `StdioCollector`: there is no need to trade bounded memory for completeness,
+// so the streaming design is used for every process here.
 //
 // What is kept
 // ------------
-// The **tail**, in whole lines. For `netbird status --json` the document is
-// printed after any gRPC warning chatter, so keeping the head would preserve
-// the noise and discard the answer; for `up`, `down`, `networks` and `profile`
-// the useful line — the prompt, the failure — is likewise last.
+// The **tail**. For `netbird status --json` the document is printed after any
+// gRPC warning chatter, so keeping the head would preserve the noise and
+// discard the answer; for `up`, `down`, `networks` and `profile` the useful
+// line — the prompt, the failure — is likewise last.
 //
-// `limit` counts UTF-16 code units, not bytes, and trimming happens on line
-// boundaries so a multi-byte character is never cut in half. Line-oriented
-// trimming is why this is safe: a code point cannot straddle a `\n`.
+// Trimming is `Model.trimToLimit`: whole lines from the front, and for the one
+// case with no line boundary to land on (a single line longer than the whole
+// budget) the cut steps off a low surrogate so the result never begins with
+// half a code point. `limit` counts UTF-16 code units, not bytes.
 SplitParser {
   id: root
 
@@ -64,20 +69,7 @@ SplitParser {
     var next = text === "" ? chunk : text + "\n" + chunk
 
     if (next.length > limit) {
-      // Drop whole lines from the front until it fits. Never a mid-line cut, so
-      // no surrogate pair or multi-byte sequence is ever split.
-      var cut = 0
-      while (next.length - cut > limit) {
-        var nl = next.indexOf("\n", cut)
-        if (nl === -1) {
-          // One line longer than the cap: keep its tail rather than nothing,
-          // and accept that this single case can cut inside a line.
-          cut = next.length - limit
-          break
-        }
-        cut = nl + 1
-      }
-      next = next.substring(cut)
+      next = Model.trimToLimit(next, limit)
       truncated = true
     }
 

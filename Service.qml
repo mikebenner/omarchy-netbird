@@ -68,6 +68,12 @@ Item {
   // mid-write match on the way out and apply a pre-write snapshot.
   property int _networkWritesCompleted: 0
   property int _networkReadSeq: 0
+  // Set whenever a list result is thrown away for ordering, or a scheduled
+  // re-read is refused because something was already running. Every list and
+  // action exit checks it, so no interleaving can end with stale rows on
+  // screen and nothing queued to correct them.
+  property bool _networksDirty: false
+  property bool _profilesDirty: false
 
   property var profiles: []
   property bool profilesLoaded: false
@@ -86,8 +92,16 @@ Item {
   // Three poll cadences wide, never under fifteen seconds: long enough that a
   // slow-but-healthy `netbird status` is never mistaken for a hung one.
   readonly property int pollTimeoutSec: Math.max(15, refreshIntervalSec * 3)
-  readonly property bool busy: whichProcess.running || statusProcess.running || actionProcess.running || loginProcess.running
+  // Everything that changes the daemon's state, so no two such commands can
+  // overlap. Profile selection recycles the engine, which is at least as
+  // disruptive as a toggle, so it belongs here too.
+  readonly property bool busy: whichProcess.running || statusProcess.running || actionProcess.running
+    || loginProcess.running || profileActionProcess.running
   readonly property bool networksBusy: networksProcess.running || networkActionProcess.running
+  // Any command that mutates the daemon or its selection. Used to serialise
+  // profile switching against tunnel and network work in both directions.
+  readonly property bool mutating: actionProcess.running || loginProcess.running
+    || networkActionProcess.running || profileActionProcess.running
   readonly property bool profilesBusy: profilesProcess.running || profileActionProcess.running
   readonly property string adminUrl: Model.adminConsoleUrl(managementUrl, setting("adminConsoleUrl", ""))
   // While the daemon is missing there is nothing to poll for; back off instead
@@ -171,15 +185,33 @@ Item {
 
   function refreshNetworks() {
     if (!installed || daemonDown || !running || !panelOpen) return false
-    // Never read across a write. The action's own exit schedules the re-read,
-    // so nothing is lost by refusing here.
-    if (!Model.canStartNetworksRead(networkActionProcess.running, networksProcess.running)) return false
+    // Never read across a write. Refusing here is safe only because the refusal
+    // is recorded: the next exit that finds nothing running starts the read.
+    if (!Model.canStartNetworksRead(networkActionProcess.running, networksProcess.running)) {
+      _networksDirty = true
+      return false
+    }
+    _networksDirty = false
     _networkReadSeq = _networkWritesCompleted
     networksStdout.reset()
     networksStderr.reset()
     networksProcess.command = Model.networksListCommand()
     networksProcess.running = true
     return true
+  }
+
+  // Start the read a refusal or a discard owed us, the moment nothing is in
+  // the way. Called from every list and action exit.
+  function _drainNetworksDirty() {
+    if (!_networksDirty) return
+    if (!Model.canStartNetworksRead(networkActionProcess.running, networksProcess.running)) return
+    refreshNetworks()
+  }
+
+  function _drainProfilesDirty() {
+    if (!_profilesDirty) return
+    if (profilesProcess.running || profileActionProcess.running) return
+    refreshProfiles()
   }
 
   function networkSelected(id) {
@@ -204,7 +236,7 @@ Item {
   }
 
   function _runNetworkAction(command) {
-    if (!installed || daemonDown || networkActionProcess.running) return false
+    if (!installed || daemonDown || networkActionProcess.running || profileActionProcess.running) return false
     networkActionStdout.reset()
     networkActionStderr.reset()
     networkActionProcess.command = command
@@ -237,7 +269,12 @@ Item {
   // --- profiles -------------------------------------------------------------
 
   function refreshProfiles() {
-    if (!installed || daemonDown || !panelOpen || profilesProcess.running) return false
+    if (!installed || daemonDown || !panelOpen) return false
+    if (profilesProcess.running || profileActionProcess.running) {
+      _profilesDirty = true
+      return false
+    }
+    _profilesDirty = false
     profilesStdout.reset()
     profilesStderr.reset()
     profilesProcess.command = Model.profileListCommand()
@@ -254,7 +291,10 @@ Item {
   function selectProfile(name) {
     var target = String(name || "")
     if (target === "" || target === activeProfile()) return false
-    if (!installed || daemonDown || profileActionProcess.running || actionProcess.running || loginProcess.running) return false
+    // Serialised against every other command: switching recycles the engine,
+    // so it must not overlap a toggle, a login, or a network change — and a
+    // stale list must not be the thing being selected from.
+    if (!installed || daemonDown || mutating || profilesProcess.running) return false
     actionStatus = "Switching to profile " + target + "…"
     profileActionStdout.reset()
     profileActionStderr.reset()
@@ -430,7 +470,7 @@ Item {
   }
 
   function down() {
-    if (!installed || daemonDown) return false
+    if (!installed || daemonDown || profileActionProcess.running) return false
     // "Off" wins over a login still waiting on a browser.
     if (loginProcess.running) cancelLogin()
     if (actionProcess.running) return false
@@ -443,7 +483,7 @@ Item {
   }
 
   function up() {
-    if (!installed || daemonDown || actionProcess.running || loginProcess.running) return false
+    if (!installed || daemonDown || profileActionProcess.running || actionProcess.running || loginProcess.running) return false
     _loginBuffer = ""
     _loginUrlOpened = false
     loginCode = ""
@@ -732,11 +772,21 @@ Item {
       // the row back under them.
       // Ordered against completed writes, and rejected outright if a write
       // started while this read was in flight.
-      if (!Model.shouldApplyNetworksRead(root._networkReadSeq, root._networkWritesCompleted, networkActionProcess.running)) return
-      if (exitCode !== 0) return
+      if (!Model.shouldApplyNetworksRead(root._networkReadSeq, root._networkWritesCompleted, networkActionProcess.running)) {
+        // Discarded — so the rows on screen are stale and something must go
+        // back for the truth.
+        root._networksDirty = true
+        root._drainNetworksDirty()
+        return
+      }
+      if (exitCode !== 0) {
+        root._drainNetworksDirty()
+        return
+      }
       root.networks = Model.parseNetworksList(String(networksStdout.tail || ""))
       root.networksLoaded = true
       root.networkDesired = {}
+      root._drainNetworksDirty()
     }
   }
 
@@ -747,9 +797,13 @@ Item {
     stdout: BoundedCollector { id: profilesStdout; limit: 16384 }
     stderr: BoundedCollector { id: profilesStderr; limit: 16384 }
     onExited: function(exitCode) {
-      if (exitCode !== 0) return
+      if (exitCode !== 0) {
+        root._drainProfilesDirty()
+        return
+      }
       root.profiles = Model.parseProfileList(String(profilesStdout.tail || ""))
       root.profilesLoaded = true
+      root._drainProfilesDirty()
     }
   }
 
@@ -772,9 +826,11 @@ Item {
       // needing a login on the target profile. Let the ordinary states carry
       // whatever it reports.
       root.profilesLoaded = false
+      root._profilesDirty = true
+      root._networksDirty = true
       delayedRefresh.restart()
       networksRefreshDelay.restart()
-      root.refreshProfiles()
+      root._drainProfilesDirty()
     }
   }
 
@@ -795,6 +851,7 @@ Item {
       // The write is done: from here a read can be trusted again.
       root._networkWritesCompleted += 1
       // Re-read either way: on success to see it, on failure to see the truth.
+      root._networksDirty = true
       networksRefreshDelay.restart()
     }
   }

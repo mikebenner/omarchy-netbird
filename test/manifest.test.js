@@ -46,7 +46,12 @@ test("every entry point is a safe relative path that exists", () => {
     assert.ok(!target.includes("\n"), `${kind}: entry point may not contain a newline`)
     assert.ok(!target.startsWith("/"), `${kind}: entry point must be relative`)
     assert.ok(!target.includes(".."), `${kind}: entry point may not contain '..'`)
-    assert.ok(fs.existsSync(path.join(ROOT, target)), `${kind}: entry point file not found: ${target}`)
+    // The validator requires a regular file, not merely something that exists:
+    // a directory at an entry point passes `-f`-less checks and then fails to
+    // load. Mirror that, or this suite is weaker than the tool it stands in for.
+    const full = path.join(ROOT, target)
+    assert.ok(fs.existsSync(full), `${kind}: entry point file not found: ${target}`)
+    assert.ok(fs.statSync(full).isFile(), `${kind}: entry point is not a regular file: ${target}`)
   }
 })
 
@@ -101,7 +106,9 @@ test("every setting in the schema has a matching default", () => {
 test("the tree contains no symlinks", () => {
   // A symlink inside a plugin folder could point back at arbitrary files once
   // the folder is copied into the trusted plugins directory.
-  const skip = new Set([".git", "node_modules"])
+  // Only `.git` is skipped — the validator walks everything else, and a
+  // symlink under `node_modules` would ship just the same.
+  const skip = new Set([".git"])
   const found = []
 
   function walk(dir) {
