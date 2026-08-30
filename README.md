@@ -5,7 +5,7 @@ first-party `omarchy.tailscale` widget: the same bar icon, the same
 keyboard-driven popup, the same power switch in the hero, and the same copy
 menus. Everything it knows comes from the `netbird` CLI.
 
-<!-- screenshot: bar icon + open panel — add docs/screenshot.png -->
+![NetBird bar widget](preview.png)
 
 ## Features
 
@@ -26,19 +26,23 @@ menus. Everything it knows comes from the `netbird` CLI.
   `netbird up --no-browser`, picks the login URL out of its output, and hands
   it to `omarchy-launch-browser`
 
-## Keyboard shortcuts
+## Requirements
 
-Inside the panel:
+| Needs | Why | Arch package |
+|---|---|---|
+| Omarchy with the quickshell shell | Hosts the plugin; provides `omarchy plugin`, `omarchy bar` and `omarchy-launch-browser` | `omarchy` (developed against 4.0.1) |
+| `netbird` CLI **and** a running daemon | Every piece of state comes from `netbird status --json`; the toggle runs `netbird up` / `netbird down` | `netbird-bin` (developed against 0.77.1) |
+| `wl-copy` | The copy actions on the device and peer rows | `wl-clipboard` |
+| `omarchy-launch-browser` | Opens the SSO URL when the daemon needs to re-authenticate | ships with `omarchy` |
 
-- `j` / `k` or arrows: move cursor
-- `enter` / `space`: activate current row (toggle on the hero, copy menu on a
-  device or peer row)
-- `c`: copy the selected row's NetBird address
-- `n`: copy the selected row's short name
-- `d`: copy the selected row's FQDN
-- `t`: toggle NetBird
-- `r`: refresh status
-- `esc`: close
+**No `sudo` or `pkexec`, ever.** NetBird's daemon socket
+(`/var/run/netbird.sock`) is created world-writable (`srw-rw-rw-`), so
+`status`, `up` and `down` all succeed as your own user. There is no equivalent
+of Tailscale's `tailscale set --operator` handshake and the widget never asks
+for one.
+
+The widget reads and writes nothing outside the NetBird CLI, your clipboard,
+and its own entry in `~/.config/omarchy/shell.json`.
 
 ## Install
 
@@ -52,14 +56,39 @@ Then place it in the bar, e.g. next to the network widget:
 omarchy plugin enable mikebenner.netbird --section right --before omarchy.network
 ```
 
+## Removal
+
+```bash
+omarchy plugin disable mikebenner.netbird   # keep it installed, take it off the bar
+omarchy plugin remove mikebenner.netbird    # remove it entirely
+```
+
+Neither touches NetBird itself — the daemon, the CLI and your login stay as
+they are. If you had disabled the `netbird-ui` tray app (see below) and want it
+back, set `Hidden=false` in `~/.config/autostart/netbird.desktop`, or reinstall
+it if you removed the file:
+
+```bash
+sed -i 's/^Hidden=true$/Hidden=false/' ~/.config/autostart/netbird.desktop
+```
+
 ## Settings
 
 Settings live inline on the widget's entry in `~/.config/omarchy/shell.json`.
+Change them with `omarchy bar set`:
 
-| Key | Type | Default | Range | What it does |
+| Key | Type | Default | Values | What it does |
 |---|---|---|---|---|
 | `refreshIntervalSec` | integer | `30` | 5–3600 | How often `netbird status --json` is polled |
 | `iconStyle` | enum | `theme` | `theme`, `color` | Themed vector mark, or NetBird's own coloured artwork |
+
+```bash
+omarchy bar set mikebenner.netbird refreshIntervalSec 15
+omarchy bar set mikebenner.netbird iconStyle color
+```
+
+Settings are read live from `shell.json`, so a change takes effect without
+restarting the shell.
 
 ## IPC
 
@@ -73,12 +102,27 @@ omarchy-shell mikebenner.netbird down      # netbird down
 omarchy-shell mikebenner.netbird status    # one-line summary of the mesh
 ```
 
-`status` answers with the daemon state, this device's name and address, the
-peer count, and the session clock, e.g.
+`up` and `down` answer `ok`, or `busy` when the other one is still running —
+the widget runs at most one of them at a time. `status` answers with the daemon
+state, this device's name and address, the peer count, and the session clock:
 
 ```
 Connected · laptop · 100.64.0.9 · 1/4 peers · session expires in 1d 6h
 ```
+
+## Keyboard shortcuts
+
+Inside the panel:
+
+- `j` / `k` or arrows: move cursor
+- `enter` / `space`: activate current row (toggle on the hero, copy menu on a
+  device or peer row)
+- `c`: copy the selected row's NetBird address
+- `n`: copy the selected row's short name
+- `d`: copy the selected row's FQDN
+- `t`: toggle NetBird
+- `r`: refresh status
+- `esc`: close
 
 ## Replaces netbird-ui-bin
 
@@ -119,39 +163,6 @@ systemctl --user stop 'app-netbird@autostart.service'
 The `netbird` daemon and the `netbird` CLI are untouched — the widget needs
 both.
 
-## Requirements
-
-- `netbird` CLI on `PATH`, with the daemon running
-- `wl-copy` for the copy actions
-- `omarchy-launch-browser` for SSO login
-
-No privilege escalation: `/var/run/netbird.sock` is world-writable, so
-`status`, `up`, and `down` all run as you. There is no equivalent of
-Tailscale's `tailscale set --operator` handshake and the widget never asks for
-one.
-
-## Limitations
-
-Two deliberate edges in the parsing, both chosen over guessing:
-
-- The management-host check that stops the SSO flow opening the daemon's own
-  endpoint compares ASCII hostnames. There is no IDNA canonicalisation, so an
-  internationalised management URL and its punycode spelling
-  (`bücher.example` vs `xn--bcher-kva.example`) do not compare equal.
-- When `netbird status --json` prefixes its document with chatter, the
-  recovery sweep tries at most 32 candidate object starts. Brace-bearing prose
-  (`WARNING grpc target {Addr:"/run/netbird.sock"}`) is skipped without
-  spending that budget, but a document preceded by more than 32 genuine JSON
-  fragments is reported as a parse error rather than recovered. It fails
-  safely: the widget shows a status error and keeps the CLI's own message,
-  never an invented state.
-
-## What was dropped from the Tailscale widget
-
-NetBird has no analogue for these, so they are simply gone: exit nodes,
-Mullvad regions, account/profile switching, Taildrop file sending, and the
-operator authorization row.
-
 ## Icon
 
 The bar shows the NetBird mark, one icon per connection state. Two styles:
@@ -184,6 +195,28 @@ BSD-3-Clause, taken unmodified from
 [netbirdio/netbird](https://github.com/netbirdio/netbird) — see
 [`assets/NOTICE`](assets/NOTICE) for the pinned commit, the exact upstream
 paths, checksums, and licence.
+
+## Limitations
+
+Two deliberate edges in the parsing, both chosen over guessing:
+
+- The management-host check that stops the SSO flow opening the daemon's own
+  endpoint compares ASCII hostnames. There is no IDNA canonicalisation, so an
+  internationalised management URL and its punycode spelling
+  (`bücher.example` vs `xn--bcher-kva.example`) do not compare equal.
+- When `netbird status --json` prefixes its document with chatter, the
+  recovery sweep tries at most 32 candidate object starts. Brace-bearing prose
+  (`WARNING grpc target {Addr:"/run/netbird.sock"}`) is skipped without
+  spending that budget, but a document preceded by more than 32 genuine JSON
+  fragments is reported as a parse error rather than recovered. It fails
+  safely: the widget shows a status error and keeps the CLI's own message,
+  never an invented state.
+
+## What was dropped from the Tailscale widget
+
+NetBird has no analogue for these, so they are simply gone: exit nodes,
+Mullvad regions, account/profile switching, Taildrop file sending, and the
+operator authorization row.
 
 ## Tests
 
