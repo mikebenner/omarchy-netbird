@@ -197,13 +197,15 @@ function peerCountText(status) {
 // Is this the shape `netbird status --json` returns, or merely some JSON that
 // happened to be on stdout? Without this, `{"error":"permission denied"}`
 // parses "successfully" into an all-defaults document and the real error text
-// is thrown away. A field present but null still counts: Go marshals an absent
-// sub-struct as null, and the key is what identifies the document.
+// is thrown away.
+//
+// At the top level `peers` and `management` are sub-objects the daemon always
+// fills in, so a null one is not evidence of a status document — the nullable
+// Go slice lives one level down at `peers.details`, and that stays welcome
+// (see the Array.isArray guard in parseStatus).
 function hasStatusObjectField(value, name) {
-  if (!(name in value)) return false
   var field = value[name]
-  if (field === null) return true
-  return typeof field === "object" && typeof field.length !== "number"
+  return !!field && typeof field === "object" && typeof field.length !== "number"
 }
 
 function isStatusDocument(value) {
@@ -227,35 +229,75 @@ function parseStatusJson(text) {
 // last brace" is not enough — a gRPC warning carries braces of its own
 // (`WARNING grpc target {Addr:"/var/run/netbird.sock"}`) and swallowing it
 // makes the combined span unparseable. So: whole string, then each line alone,
-// then a bounded sweep of brace positions against every plausible end.
+// then a bounded sweep of brace positions against plausible ends.
+//
+// Both ends of the sweep are capped. Starts were always capped; ends used to
+// grow with the line count and were de-duplicated with a linear scan, so a
+// long braced prefix cost time quadratic in its length. The document we want
+// is whatever the CLI printed last, so only the ends nearest the end of the
+// output are worth trying.
 var MAX_JSON_STARTS = 32
+var MAX_JSON_ENDS = 32
+
+// `{` followed by `"` or `}` (whitespace aside) is the only way a JSON object
+// can begin. Anything else — `{Addr:`, `{x0}` — is prose.
+function opensJsonObject(text, open) {
+  for (var i = open + 1; i < text.length; i++) {
+    var ch = text.charAt(i)
+    if (ch === " " || ch === "\t" || ch === "\r" || ch === "\n") continue
+    return ch === "\"" || ch === "}"
+  }
+  return false
+}
 
 function findStatusJson(text) {
   var whole = parseStatusJson(text)
   if (whole) return whole
 
-  var lines = text.split(/\r?\n/)
+  // Split on "\n" alone so a line's offset is exactly the sum of the lengths
+  // before it — splitting on /\r?\n/ drops a character per CRLF line and
+  // slides every later offset out of place. A trailing "\r" is trimmed off
+  // before parsing, so it costs nothing.
+  var lines = text.split("\n")
   var i
   for (i = 0; i < lines.length; i++) {
     var alone = parseStatusJson(lines[i].trim())
     if (alone) return alone
   }
 
-  // Candidate ends: the last `}` overall, plus the last `}` on each line — a
-  // document usually ends where its line does.
-  var ends = []
-  var last = text.lastIndexOf("}")
-  if (last !== -1) ends.push(last)
+  // Candidate ends: the last `}` overall, plus the last `}` on each of the
+  // final MAX_JSON_ENDS lines that carry one — a document usually ends where
+  // its line does.
+  var lineCloses = []
   var offset = 0
   for (i = 0; i < lines.length; i++) {
-    var lineEnd = offset + lines[i].length
-    var close = text.lastIndexOf("}", lineEnd - 1)
-    if (close >= offset && ends.indexOf(close) === -1) ends.push(close)
-    offset = lineEnd + 1
+    var close = lines[i].lastIndexOf("}")
+    if (close !== -1) lineCloses.push(offset + close)
+    offset += lines[i].length + 1
+  }
+  if (lineCloses.length > MAX_JSON_ENDS) lineCloses = lineCloses.slice(lineCloses.length - MAX_JSON_ENDS)
+
+  var seen = {}
+  var ends = []
+  var last = text.lastIndexOf("}")
+  if (last !== -1) {
+    ends.push(last)
+    seen[last] = true
+  }
+  for (i = 0; i < lineCloses.length; i++) {
+    if (seen[lineCloses[i]]) continue
+    seen[lineCloses[i]] = true
+    ends.push(lineCloses[i])
   }
 
   var starts = 0
   for (var open = text.indexOf("{"); open !== -1 && starts < MAX_JSON_STARTS; open = text.indexOf("{", open + 1)) {
+    // A brace that cannot open a JSON object is not worth a candidate, and
+    // skipping it costs one character instead of copying tens of kilobytes.
+    // Warning text is full of them (`{Addr:"/run/netbird.sock"}`), and letting
+    // them consume the start budget was also what hid a real document sitting
+    // behind a long braced prefix.
+    if (!opensJsonObject(text, open)) continue
     starts++
     for (var e = 0; e < ends.length; e++) {
       if (ends[e] <= open) continue
@@ -401,6 +443,38 @@ function hostKey(url) {
   return text.toLowerCase().replace(/\.$/, "")
 }
 
+// A URL at the end of a sentence picks up the sentence's punctuation, but a
+// bracket may equally be the URL's own: `https://[2001:db8::1]` ends in a `]`
+// that closes its IPv6 literal, and stripping it leaves an address that no
+// longer normalises to the host it names. Peel one character at a time, and
+// only surrender a closing bracket that has no opener left to match.
+function countChar(text, ch) {
+  var total = 0
+  for (var i = 0; i < text.length; i++) if (text.charAt(i) === ch) total++
+  return total
+}
+
+function trimUrlPunctuation(url) {
+  var text = String(url || "")
+  while (text.length > 0) {
+    var last = text.charAt(text.length - 1)
+    if (".,;:!?".indexOf(last) !== -1) {
+      text = text.substring(0, text.length - 1)
+      continue
+    }
+    if (last === "]" && countChar(text, "]") > countChar(text, "[")) {
+      text = text.substring(0, text.length - 1)
+      continue
+    }
+    if (last === ")" && countChar(text, ")") > countChar(text, "(")) {
+      text = text.substring(0, text.length - 1)
+      continue
+    }
+    break
+  }
+  return text
+}
+
 function extractAuthUrl(text, excludeUrl) {
   var value = String(text || "")
   if (!SSO_PROMPT.test(value)) return ""
@@ -417,7 +491,7 @@ function extractAuthUrl(text, excludeUrl) {
     // report, and treating it as one loses a legitimate prompt.
     if (FAILURE_LINE.test(line.replace(/https?:\/\/\S+/g, " "))) continue
     for (var j = 0; j < urls.length; j++) {
-      var url = urls[j].replace(/[.,;:)\]]+$/, "")
+      var url = trimUrlPunctuation(urls[j])
       if (excluded !== "" && url === excluded) continue
       // The management and admin endpoints are printed by the daemon's own
       // chatter; the identity provider is somewhere else.
@@ -496,6 +570,7 @@ if (typeof module !== "undefined") {
     peerCountText: peerCountText,
     isStatusDocument: isStatusDocument,
     hostKey: hostKey,
+    trimUrlPunctuation: trimUrlPunctuation,
     parseStatus: parseStatus,
     extractAuthUrl: extractAuthUrl,
     loginProgress: loginProgress,

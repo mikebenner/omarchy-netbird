@@ -129,6 +129,22 @@ No privilege escalation: `/var/run/netbird.sock` is world-writable, so
 Tailscale's `tailscale set --operator` handshake and the widget never asks for
 one.
 
+## Limitations
+
+Two deliberate edges in the parsing, both chosen over guessing:
+
+- The management-host check that stops the SSO flow opening the daemon's own
+  endpoint compares ASCII hostnames. There is no IDNA canonicalisation, so an
+  internationalised management URL and its punycode spelling
+  (`bücher.example` vs `xn--bcher-kva.example`) do not compare equal.
+- When `netbird status --json` prefixes its document with chatter, the
+  recovery sweep tries at most 32 candidate object starts. Brace-bearing prose
+  (`WARNING grpc target {Addr:"/run/netbird.sock"}`) is skipped without
+  spending that budget, but a document preceded by more than 32 genuine JSON
+  fragments is reported as a parse error rather than recovered. It fails
+  safely: the widget shows a status error and keeps the CLI's own message,
+  never an invented state.
+
 ## What was dropped from the Tailscale widget
 
 NetBird has no analogue for these, so they are simply gone: exit nodes,

@@ -243,7 +243,7 @@ test("a null peers.details parses to zero peers without throwing", () => {
   }
 
   // The same must hold for the other shapes the field can arrive in.
-  for (const raw of ['{"peers":{"details":{}}}', '{"peers":null}', '{"peers":{"details":"nope"}}']) {
+  for (const raw of ['{"peers":{"details":{}}}', '{"peers":{"details":"nope"}}']) {
     const status = Model.parseStatus(raw, NOW)
     assert.equal(status.ok, true)
     assert.deepEqual(status.peers, [])
@@ -510,13 +510,122 @@ test("only a status-shaped document is accepted as status", () => {
   assert.equal(Model.isStatusDocument({ daemonStatus: "Idle" }), true)
   assert.equal(Model.isStatusDocument({ peers: { total: 0 } }), true)
   assert.equal(Model.isStatusDocument({ management: { connected: true } }), true)
-  // Go marshals an absent sub-struct as null; the key is the identity.
-  assert.equal(Model.isStatusDocument({ peers: null }), true)
+  // A null top-level sub-object is not evidence of a status document; the
+  // nullable Go slice lives at peers.details, one level down.
+  assert.equal(Model.isStatusDocument({ peers: null }), false)
+  assert.equal(Model.isStatusDocument({ management: null }), false)
+  assert.equal(Model.isStatusDocument({ peers: { details: null } }), true)
   assert.equal(Model.isStatusDocument({ error: "permission denied" }), false)
   assert.equal(Model.isStatusDocument({ daemonStatus: 7 }), false)
   assert.equal(Model.isStatusDocument({ peers: "none" }), false)
   assert.equal(Model.isStatusDocument([{ daemonStatus: "Idle" }]), false)
   assert.equal(Model.isStatusDocument(null), false)
+})
+
+// NB-06 residual. The daemon always fills in its top-level sub-objects; the
+// nullable Go slice is one level down at peers.details.
+test("a null top-level sub-object is not a status document", () => {
+  const nulled = Model.parseStatus('{"peers":null}', NOW)
+  assert.equal(nulled.ok, false)
+  assert.equal(nulled.unavailable, true)
+  assert.equal(nulled.error, "netbird status output is not a status document")
+  assert.equal(Model.parseStatus('{"management":null}', NOW).ok, false)
+  assert.equal(Model.parseStatus('{"peers":null,"management":null}', NOW).ok, false)
+
+  // The nested null the daemon really does emit is still fine.
+  const nested = Model.parseStatus('{"peers":{"details":null}}', NOW)
+  assert.equal(nested.ok, true)
+  assert.deepEqual(nested.peers, [])
+  // And a null sub-object alongside a real daemonStatus is still a document.
+  assert.equal(Model.parseStatus('{"daemonStatus":"Idle","peers":null}', NOW).ok, true)
+})
+
+// NB-04 residual. The `]` closing an IPv6 literal is part of the URL, not the
+// sentence's punctuation.
+test("a bracketed IPv6 URL keeps its closing bracket", () => {
+  const management = "https://[2001:db8::1]:443"
+  const prompt = "Use this URL to log in: "
+
+  // Both forms name the management host and must be suppressed.
+  assert.equal(Model.extractAuthUrl(prompt + "https://[2001:db8::1]", management), "")
+  assert.equal(Model.extractAuthUrl(prompt + "https://[2001:db8::1]/device", management), "")
+  assert.equal(Model.extractAuthUrl(prompt + "https://[2001:db8::1]:8443/device", management), "")
+  // A different host still extracts, bracket intact.
+  assert.equal(Model.extractAuthUrl(prompt + "https://[2001:db8::2]/device", management), "https://[2001:db8::2]/device")
+  assert.equal(Model.extractAuthUrl(prompt + "https://idp.example/", management), "https://idp.example/")
+
+  assert.equal(Model.trimUrlPunctuation("https://[2001:db8::1]"), "https://[2001:db8::1]")
+  assert.equal(Model.trimUrlPunctuation("https://[2001:db8::1]."), "https://[2001:db8::1]")
+  // An unmatched bracket really is punctuation.
+  assert.equal(Model.trimUrlPunctuation("https://idp.example/x]"), "https://idp.example/x")
+  assert.equal(Model.trimUrlPunctuation("https://idp.example/x)"), "https://idp.example/x")
+  assert.equal(Model.trimUrlPunctuation("https://idp.example/x(y)"), "https://idp.example/x(y)")
+  assert.equal(Model.trimUrlPunctuation("https://idp.example/x,;:"), "https://idp.example/x")
+
+  // Ordinary sentence punctuation is still peeled.
+  assert.equal(Model.extractAuthUrl(prompt + "see https://idp.example/activate.", ""), "https://idp.example/activate")
+  assert.equal(Model.extractAuthUrl(prompt + "(https://idp.example/activate)", ""), "https://idp.example/activate")
+})
+
+// NB-05 residual. The sweep is bounded at both ends now; a long braced prefix
+// used to cost time quadratic in its line count.
+test("a long braced prefix is resolved or refused quickly", () => {
+  const prefix = Array.from({ length: 3200 }, (_, i) => `WARNING grpc target {Addr:"/run/n${i}.sock"}`).join("\n")
+  const input = prefix + "\n" + '{"daemonStatus":"Idle"}'
+
+  // Best of three: this asserts an algorithmic bound, and a single sample on a
+  // loaded machine measures the scheduler as much as the parser. The minimum
+  // still rises with the line count if the sweep ever goes quadratic again,
+  // which is the regression worth catching — it used to cost ~500 ms here.
+  const fastest = (raw) => {
+    let best = Infinity
+    let result = null
+    for (let i = 0; i < 3; i++) {
+      const started = Date.now()
+      result = Model.parseStatus(raw, NOW)
+      best = Math.min(best, Date.now() - started)
+    }
+    return { best, result }
+  }
+
+  const withDoc = fastest(input)
+  assert.ok(withDoc.best < 100, `sweep took ${withDoc.best} ms`)
+  assert.equal(withDoc.result.ok, true)
+  assert.equal(withDoc.result.daemonStatus, "Idle")
+
+  // The same length with no document at all must also stay cheap and refuse.
+  const withoutDoc = fastest(prefix)
+  assert.ok(withoutDoc.best < 100, `refusal took ${withoutDoc.best} ms`)
+  assert.equal(withoutDoc.result.ok, false)
+})
+
+test("brace-bearing prose no longer spends the sweep's start budget", () => {
+  const pretty = '{\n  "daemonStatus": "Idle"\n}'
+
+  // 40 `{x}` fragments used to push the real document's opening brace past
+  // MAX_JSON_STARTS, and being pretty-printed it is invisible to the per-line
+  // pass too. `{x0}` cannot open a JSON object, so it is skipped for one
+  // character now and the document is recovered.
+  const prose = Array.from({ length: 40 }, (_, i) => `WARN {x${i}}`).join("\n")
+  assert.equal(Model.parseStatus(prose + "\n" + pretty, NOW).daemonStatus, "Idle")
+
+  // What still exceeds the cap is 40 genuine JSON objects ahead of the
+  // document — each one is a plausible start. That fails safely: a parse
+  // error, never an invented status.
+  const objects = Array.from({ length: 40 }, (_, i) => `WARN ${JSON.stringify({ x: i })}`).join("\n")
+  let status
+  assert.doesNotThrow(() => {
+    status = Model.parseStatus(objects + "\n" + pretty, NOW)
+  })
+  assert.equal(status.ok, false)
+  assert.equal(status.unavailable, true)
+  assert.equal(status.daemonStatus, "Unknown")
+  assert.equal(status.statusText, "Status error")
+  assert.equal(status.error, "Failed to parse netbird status")
+
+  // Fewer than the cap and the same document is recovered.
+  const few = Array.from({ length: 5 }, (_, i) => `WARN ${JSON.stringify({ x: i })}`).join("\n")
+  assert.equal(Model.parseStatus(few + "\n" + pretty, NOW).daemonStatus, "Idle")
 })
 
 test("extractAuthUrl only opens a browser for an actual login prompt", () => {
