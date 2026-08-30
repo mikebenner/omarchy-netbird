@@ -1096,8 +1096,50 @@ test("parseProfileList refuses anything that is not the table", () => {
   const trailing = PROFILE_TABLE + "WARNING failed to read cache\n"
   assert.deepEqual(Model.parseProfileList(trailing).map((p) => p.name), ["default", "Work Account", "büro"])
 
-  // A line too short to reach the ACTIVE column is not a row either.
+  // A line too short to reach the ACTIVE column is not a row either: the
+  // printer pads the name cell even before an empty marker, so every real row
+  // reaches the column, trailing spaces and all.
   assert.deepEqual(Model.parseProfileList("NAME          ACTIVE\nshort\n"), [])
+})
+
+test("printer-impossible tables yield no phantom or mis-split rows", () => {
+  // Two tables from review, each aligned closely enough to fool a heuristic
+  // but impossible for the real printer — v0.77.1 client/cmd/profile.go,
+  // tabwriter.NewWriter(out, 0, 0, 2, ' ', 0).
+  //
+  // A single-space header: tabwriter pads the NAME column to its widest cell
+  // plus 2, and "NAME" is itself 4 wide, so ACTIVE can never start closer
+  // than "NAME  ACTIVE". No header means no table — and in particular "Work"
+  // is NOT read out of "Work  Account ✓" as a selectable profile.
+  assert.deepEqual(Model.parseProfileList("NAME ACTIVE\nWork  Account ✓\n"), [])
+
+  // Trailing prose that happens to align with the boundary: geometry alone
+  // accepts it ("WARNING x" plus spaces reaches the ACTIVE column), but the
+  // printer writes exactly "✓" or "" there — never "danger" — so the line is
+  // rejected rather than becoming active profile "WARNING x".
+  assert.deepEqual(Model.parseProfileList("NAME          ACTIVE\nWARNING x     danger\n"), [])
+})
+
+test("the narrowest table the printer can emit parses back", () => {
+  // Verified by running Go's tabwriter with the printer's exact parameters:
+  // with every name shorter than "NAME" the column is len("NAME") + 2 wide —
+  // the two-space minimum — and the inactive row still carries its padding
+  // out to the ACTIVE column.
+  assert.deepEqual(Model.parseProfileList("NAME  ACTIVE\nNB    \n"), [{ name: "NB", active: false }])
+})
+
+test("only names from the applied list are selectable", () => {
+  // The belt behind the parser: whatever a future or hostile table might
+  // sneak past the rules, `selectProfile` refuses any name the most recently
+  // applied parse did not produce.
+  const list = Model.parseProfileList(PROFILE_TABLE)
+  assert.equal(Model.isKnownProfile(list, "Work Account"), true)
+  assert.equal(Model.isKnownProfile(list, "büro"), true)
+  assert.equal(Model.isKnownProfile(list, "Work"), false)
+  assert.equal(Model.isKnownProfile(list, "WARNING x"), false)
+  assert.equal(Model.isKnownProfile(list, ""), false)
+  assert.equal(Model.isKnownProfile([], "default"), false)
+  assert.equal(Model.isKnownProfile(null, "default"), false)
 })
 
 // Free-form names and argv are a pair: the parser now returns names with
@@ -1315,6 +1357,256 @@ test("a networks read that loses its race is always detectable", () => {
   assert.equal(Model.shouldApplyNetworksRead(freshCaptured, completions, false), true)
 })
 
+// --- corrective reads --------------------------------------------------------
+
+// The whole obligation lifecycle lives in one function now, for networks and
+// profiles alike: the two paths had already drifted apart, each counting a
+// different thing against the failure budget.
+const CLEAN = { attempts: 0, busy: 0 }
+
+test("a corrective read that fails does not forget the obligation", () => {
+  // The reviewer's exact sequence. Write succeeds → the exit sets dirty and
+  // resets the budget. The corrective read then STARTS — and nothing is
+  // computed at start, which is the fix: an older version cleared the bit
+  // there, so a non-zero exit left stale rows with nothing queued.
+  let state = CLEAN
+
+  // The read exits non-zero: the obligation is re-asserted, one attempt spent,
+  // and a retry is scheduled rather than fired from the exit handler.
+  state = Model.correctiveStep(Model.CORRECTIVE_FAILED, state)
+  assert.equal(state.dirty, true, "a failed corrective read must leave the obligation standing")
+  assert.equal(state.attempts, 1)
+  assert.equal(state.retryMs, Model.CORRECTIVE_RETRY_MS)
+
+  // The retry succeeds and applies: obligation fulfilled, both budgets back.
+  state = Model.correctiveStep(Model.CORRECTIVE_APPLIED, state)
+  assert.deepEqual(state, { dirty: false, attempts: 0, busy: 0, retryMs: 0, waitForState: false })
+})
+
+test("the failure budget is exactly Model.MAX_CORRECTIVE_ATTEMPTS deep", () => {
+  // Asserted against the exported constant, not a hard-coded 3: the cap and
+  // the test that pins it must move together.
+  let state = CLEAN
+  for (let i = 1; i < Model.MAX_CORRECTIVE_ATTEMPTS; i++) {
+    state = Model.correctiveStep(Model.CORRECTIVE_FAILED, state)
+    assert.equal(state.dirty, true, `attempt ${i} is still inside the budget`)
+    assert.equal(state.attempts, i)
+  }
+  state = Model.correctiveStep(Model.CORRECTIVE_FAILED, state)
+  assert.equal(state.attempts, Model.MAX_CORRECTIVE_ATTEMPTS)
+  assert.equal(state.dirty, false, "the last failure must stop the automatic retries")
+  assert.equal(state.retryMs, 0, "and schedule nothing — the next natural trigger owns it")
+
+  // A success at any depth restores the full budget…
+  assert.deepEqual(Model.correctiveStep(Model.CORRECTIVE_APPLIED, { attempts: Model.MAX_CORRECTIVE_ATTEMPTS, busy: 7 }),
+    { dirty: false, attempts: 0, busy: 0, retryMs: 0, waitForState: false })
+  // …and a garbage counter is treated as a fresh one, not a crash.
+  assert.equal(Model.correctiveStep(Model.CORRECTIVE_FAILED, { attempts: "junk", busy: 0 }).attempts, 1)
+  assert.equal(Model.correctiveStep(Model.CORRECTIVE_FAILED, { attempts: -5, busy: 0 }).attempts, 1)
+  assert.equal(Model.correctiveStep(Model.CORRECTIVE_FAILED, undefined).attempts, 1)
+})
+
+test("an ordering discard is not a failure and is not made to wait like one", () => {
+  // Discards are the race the read/write ordering exists to catch: normal,
+  // self-correcting, and caused by the user clicking. Charging them against
+  // the failure budget let three clicks lose the corrective read entirely,
+  // and each one also sat out the two-second fault cadence.
+  let state = { attempts: 2, busy: 4 }
+  state = Model.correctiveStep(Model.CORRECTIVE_DISCARDED, state)
+  assert.equal(state.dirty, true)
+  assert.equal(state.attempts, 2, "a discard charges no attempt")
+  assert.equal(state.busy, 4, "and no busy refusal either")
+  assert.equal(state.retryMs, Model.CORRECTIVE_PROMPT_MS)
+  assert.ok(state.retryMs < Model.CORRECTIVE_RETRY_MS, "a discard is re-read promptly")
+
+  // However many land, the failure budget is untouched.
+  for (let i = 0; i < 50; i++) state = Model.correctiveStep(Model.CORRECTIVE_DISCARDED, state)
+  assert.equal(state.dirty, true)
+  assert.equal(state.attempts, 2)
+})
+
+test("a refusal because something else is running is bounded", () => {
+  // "Busy" is not the daemon failing, so it keeps its own generous budget —
+  // but it is a budget. Re-arming unconditionally, as the first version did,
+  // is a timer that knocks for as long as the shell runs.
+  let state = CLEAN
+  for (let i = 1; i < Model.MAX_BUSY_REFUSALS; i++) {
+    state = Model.correctiveStep(Model.CORRECTIVE_BUSY, state)
+    assert.equal(state.dirty, true, `knock ${i} is still inside the budget`)
+    assert.equal(state.busy, i)
+    assert.equal(state.attempts, 0, "a busy refusal never spends the failure budget")
+    assert.equal(state.retryMs, Model.CORRECTIVE_RETRY_MS)
+  }
+  state = Model.correctiveStep(Model.CORRECTIVE_BUSY, state)
+  assert.equal(state.busy, Model.MAX_BUSY_REFUSALS)
+  assert.equal(state.dirty, false, "the knocking stops")
+  assert.equal(state.retryMs, 0)
+  assert.ok(Model.MAX_BUSY_REFUSALS > Model.MAX_CORRECTIVE_ATTEMPTS, "and it is the more generous of the two")
+})
+
+test("a refusal for a state reason waits for the state, and charges nothing", () => {
+  // The regression this closes: `refreshProfiles()` refusing because the
+  // daemon was down (or the panel shut, or the tunnel off) returned false and
+  // re-armed nothing, so the obligation stayed set with nothing scheduled —
+  // and with the section gated on `profilesLoaded`, PROFILES was gone for the
+  // rest of the panel session. A state refusal keeps the obligation, spends
+  // no budget, and asks for no timer: the transition that unblocks it is what
+  // re-arms the drain.
+  let state = { attempts: 1, busy: 2 }
+  state = Model.correctiveStep(Model.CORRECTIVE_BLOCKED, state)
+  assert.equal(state.dirty, true, "the obligation stands")
+  assert.equal(state.waitForState, true)
+  assert.equal(state.retryMs, 0, "no timer: re-asking a state nothing has changed is a loop")
+  assert.equal(state.attempts, 1)
+  assert.equal(state.busy, 2)
+
+  // However long the daemon stays down, the budget survives for the moment it
+  // comes back.
+  for (let i = 0; i < 100; i++) state = Model.correctiveStep(Model.CORRECTIVE_BLOCKED, state)
+  assert.equal(state.attempts, 1)
+  assert.equal(state.dirty, true)
+})
+
+test("an outcome the model does not know is treated as a failure", () => {
+  // The conservative direction for an unknown: spending the budget ends, and
+  // an infinite retry does not.
+  const state = Model.correctiveStep("something new", CLEAN)
+  assert.equal(state.attempts, 1)
+  assert.equal(state.dirty, true)
+  assert.equal(state.retryMs, Model.CORRECTIVE_RETRY_MS)
+})
+
+test("a networks read that spans a profile switch is discarded, not applied", () => {
+  // A profile switch moves the whole account under the list. The generation
+  // counted only `networks select/deselect`, so a read that started before a
+  // switch and landed after it passed the ordering check, applied the
+  // previous account's rows — and, being counted as an apply, cleared the
+  // very obligation the switch had queued.
+  let generation = 0
+  const captured = generation                 // the read starts, under profile A
+
+  // The switch begins. No read may start across it…
+  assert.equal(Model.canStartNetworksRead(true, false), false)
+  // …and one already in flight cannot apply while it runs.
+  assert.equal(Model.shouldApplyNetworksRead(captured, generation, true), false)
+
+  generation += 1                              // the switch completes, on profile B
+  assert.equal(Model.shouldApplyNetworksRead(captured, generation, false), false,
+    "rows read under profile A must never be applied under profile B")
+
+  // And the discard keeps the obligation the switch queued.
+  const state = Model.correctiveStep(Model.CORRECTIVE_DISCARDED, CLEAN)
+  assert.equal(state.dirty, true)
+
+  // The re-read that follows the switch applies normally.
+  const fresh = generation
+  assert.equal(Model.shouldApplyNetworksRead(fresh, generation, false), true)
+})
+
+// --- profile table ----------------------------------------------------------
+
+test("a profile table with no rows is an answer, not a failed read", () => {
+  // Treating an empty parse as a failure turned any format drift into total
+  // feature loss — the section gone for the session — plus three spawns per
+  // trigger. Only output that is not the table at all is a failure.
+  const empty = Model.parseProfileTable("NAME  ACTIVE\n")
+  assert.equal(empty.ok, true, "the header was there: this is the document we asked for")
+  assert.deepEqual(empty.profiles, [])
+
+  const notATable = Model.parseProfileTable("Error: cannot connect to daemon\n")
+  assert.equal(notATable.ok, false, "no header, no table — the read failed")
+  assert.deepEqual(notATable.profiles, [])
+
+  assert.equal(Model.parseProfileTable("").ok, false)
+  assert.equal(Model.parseProfileTable(null).ok, false)
+})
+
+test("an unrecognised ACTIVE marker keeps the row instead of deleting it", () => {
+  // "✓" is what v0.77.1 writes, but a marker change must not delete the
+  // active profile from the switcher. The cell is only ever *empty* for an
+  // inactive profile, so any non-empty marker means active — and reading an
+  // unknown marker as inactive would be worse than reading it as active: with
+  // no row active, `activeProfile()` is "" and the panel offers a select of
+  // the profile already in use, which recycles the engine.
+  assert.deepEqual(Model.parseProfileList("NAME     ACTIVE\ndefault  \nwork     *\n"), [
+    { name: "default", active: false },
+    { name: "work", active: true }
+  ])
+  assert.deepEqual(Model.parseProfileList("NAME     ACTIVE\nwork     yes\n"), [{ name: "work", active: true }])
+  assert.deepEqual(Model.parseProfileList("NAME     ACTIVE\nwork     ✔\n"), [{ name: "work", active: true }])
+})
+
+test("a padded line of prose is not a selectable profile", () => {
+  // Geometry cannot tell aligned prose from a row — that is what the column
+  // format costs — so what the line says is the defence, and the exact width
+  // tabwriter emits is the other half.
+  //
+  // The printer pads the *name* cell to the column and then writes the
+  // trailing cell straight onto the boundary with no padding of its own, so
+  // an inactive row is exactly the column width and nothing it emits carries
+  // whitespace past the column.
+  assert.deepEqual(Model.parseProfileList("NAME          ACTIVE\nlooks fine      \n"), [],
+    "whitespace past the column is not output this printer can produce")
+  assert.deepEqual(Model.parseProfileList("NAME          ACTIVE\nlooks fine  x\n"), [],
+    "nor is anything else past it")
+  // The reported phantom, "WARNING oops  ", is exactly the column width, so
+  // geometry alone accepts it — what rejects it is what it says.
+  assert.deepEqual(Model.parseProfileList("NAME          ACTIVE\nWARNING oops  \n"), [])
+
+  // A line that says what it is, however well it aligns.
+  for (const noise of ["WARNING x     danger", "error: nope  ✓", "INFO  starting up  ", "[warn] cache  ✓",
+                       "2026-08-30T13:00:01-07:00 WARN  ✓"]) {
+    assert.deepEqual(Model.parseProfileList("NAME          ACTIVE\n" + noise + "\n"), [],
+      "a non-row line must not become a profile: " + noise)
+  }
+
+  // The narrowest real row still parses — the belts reject prose, not names.
+  assert.deepEqual(Model.parseProfileList("NAME  ACTIVE\nNB    \n"), [{ name: "NB", active: false }])
+})
+
+test("a profile name's own trailing spaces cannot survive the format, so both sides agree", () => {
+  // tabwriter pads with spaces and a name may end in spaces: `"Work "` and
+  // `"Work"` print identically, so the padding cannot be told from the name.
+  // What must not happen is the check and the command disagreeing about what
+  // the name is — a row that is clickable but never selectable. Every side
+  // normalises the same way.
+  const parsed = Model.parseProfileList("NAME     ACTIVE\nWork     ✓\n")
+  assert.deepEqual(parsed, [{ name: "Work", active: true }])
+
+  assert.equal(Model.normalizeProfileName("Work "), "Work")
+  assert.equal(Model.normalizeProfileName("  Work"), "  Work", "only the trailing side is padding")
+  assert.equal(Model.normalizeProfileName(null), "")
+
+  // What the panel clicks, what the belt approves, and what argv carries are
+  // one value.
+  assert.equal(Model.isKnownProfile(parsed, "Work "), true)
+  assert.equal(Model.isKnownProfile(parsed, "Work"), true)
+  assert.deepEqual(Model.profileSelectCommand("Work ").slice(-4), ["netbird", "profile", "select", "Work"])
+  assert.deepEqual(Model.profileSelectCommand(parsed[0].name).slice(-1), ["Work"])
+  assert.equal(Model.isKnownProfile([{ name: "Work " }], "Work"), true,
+    "a stored name with padding still matches the argv sent for it")
+})
+
+// --- failure messages -------------------------------------------------------
+
+test("a failure message says when the output behind it was truncated", () => {
+  // The README promises this of every failure message, and only the tunnel
+  // action used to do it: a truncated message presented as the whole story is
+  // how a reader concludes the wrong thing about a failure.
+  assert.equal(Model.failureText("boom", "", "fallback", false), "boom")
+  assert.equal(Model.failureText("boom", "", "fallback", true), "boom (output truncated)")
+  assert.equal(Model.failureText("", "on stdout", "fallback", true), "on stdout (output truncated)")
+  assert.equal(Model.failureText("", "", "netbird command failed", false), "netbird command failed")
+  assert.equal(Model.failureText("", "", "", true), "(output truncated)")
+
+  // Still one line, still elided — the note is not what pushes it over.
+  const long = "x".repeat(400)
+  const elided = Model.failureText(long, "", "", true)
+  assert.ok(elided.endsWith("… (output truncated)"))
+  assert.ok(elided.length < 170)
+  assert.equal(Model.failureText("two\nlines\there", "", "", false), "two lines here")
+})
+
 // --- admin console ----------------------------------------------------------
 
 test("adminConsoleUrl knows NetBird Cloud serves its dashboard elsewhere", () => {
@@ -1354,6 +1646,24 @@ test("the README describes the widget that actually ships", () => {
 
   // The backoff claim must not promise a cadence faster than the code allows.
   assert.ok(!/backs off 5 s/.test(readme), "README still claims the raw 5 s backoff")
+})
+
+test("the manifest does not contradict the code about the admin console", () => {
+  // `adminConsoleUrl` is an override: Cloud (api.netbird.io) maps to
+  // app.netbird.io automatically, and self-hosted derives from the management
+  // URL. The setting description once told Cloud users to set the value
+  // explicitly — contradicting both the code and the README — and the README
+  // guard above missed it because it only checked the key was mentioned.
+  const m = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "manifest.json"), "utf8"))
+  const entry = m.barWidget.schema.find((e) => e.key === "adminConsoleUrl")
+  assert.ok(entry, "adminConsoleUrl setting missing from the schema")
+  const description = String(entry.description || "")
+  assert.ok(/deriv/i.test(description) || /comes from/i.test(description),
+    "the description should say the URL is derived when the setting is empty")
+  assert.ok(/automatic/i.test(description),
+    "the description should say the Cloud mapping needs no configuration")
+  assert.ok(!/set (it|this)[^.]*for NetBird Cloud/i.test(description),
+    "the description must not tell Cloud users to set the value")
 })
 
 test("commands are the exact argv vectors the service runs", () => {

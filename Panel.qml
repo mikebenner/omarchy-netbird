@@ -117,11 +117,21 @@ Panel {
     return parts.join(" · ")
   }
 
-  readonly property bool showNetworks: netbird.installed && netbird.active && !netbird.daemonDown && netbird.networks.length > 0
+  // Same staleness rule as PROFILES below, and for the same reason: a profile
+  // switch drops both lists until their corrective re-reads land, so the
+  // previous account's networks are never left on screen — clicking one would
+  // send `networks select` an id belonging to an account this machine has
+  // left.
+  readonly property bool showNetworks: netbird.installed && netbird.active && !netbird.daemonDown
+    && netbird.networksLoaded && netbird.networks.length > 0
   readonly property string networksHeading: "NETWORKS — " + Model.selectedNetworkCount(netbird.networks) + "/" + netbird.networks.length
   readonly property bool showRelays: netbird.installed && netbird.active && netbird.relays.length > 0
-  // Only worth a section when there is a choice to make.
-  readonly property bool showProfiles: netbird.installed && !netbird.daemonDown && netbird.profiles.length > 1
+  // Only worth a section when there is a choice to make — and only rows from
+  // a list that was actually loaded. A profile switch drops `profilesLoaded`
+  // until the corrective re-read lands, so the section never shows the old
+  // account's rows with the old active mark while the engine recycles.
+  readonly property bool showProfiles: netbird.installed && !netbird.daemonDown
+    && netbird.profilesLoaded && netbird.profiles.length > 1
 
   readonly property var visiblePeers: Model.filterPeers(netbird.peers, root.peerQuery)
   readonly property bool filtering: root.peerQuery !== ""
@@ -354,14 +364,25 @@ Panel {
     }
     cursorActive = false
     if (panelFlick) panelFlick.contentY = 0
+    // Only the status poll is kicked here. The two list reads used to be
+    // called straight after it and were swallowed: they run synchronously,
+    // before the poll's answer can clear a `daemonDown` left over from the
+    // last time the panel was open, so both refused and — once the sections
+    // were gated on their loaded flag — stayed gone for the session. Setting
+    // `panelOpen` above already told the service both lists are owed; it
+    // starts them when its own state says they can run, including on the
+    // first poll that clears the outage.
     netbird.refresh()
-    netbird.refreshNetworks()
-    netbird.refreshProfiles()
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
   onPeerIndexChanged: scrollCursorIntoView()
   onShowSelfChanged: ensureCursor()
   onShowPeersChanged: ensureCursor()
+  // Both of these are volatile now — a profile switch hides each section
+  // until its list is re-read — so a cursor parked in one has to be moved on
+  // when it goes, or the arrow keys highlight nothing.
+  onShowProfilesChanged: ensureCursor()
+  onShowNetworksChanged: ensureCursor()
 
   Service {
     id: netbird
@@ -379,6 +400,10 @@ Panel {
   Connections {
     target: netbird
     function onPeersChanged() { root.ensureCursor() }
+    // A list that shrinks under the cursor leaves the index past its end,
+    // which highlights nothing and activates the wrong row on the way back.
+    function onNetworksChanged() { root.ensureCursor() }
+    function onProfilesChanged() { root.ensureCursor() }
   }
 
   IpcHandler {

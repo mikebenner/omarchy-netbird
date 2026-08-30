@@ -50,7 +50,7 @@
         "type": "string",
         "label": "Admin console URL",
         "defaultValue": "",
-        "description": "Where the admin console lives. Left empty it is derived from the management URL, which is right for most self-hosted deployments; set it explicitly for NetBird Cloud (https://app.netbird.io) or a split dashboard host."
+        "description": "Overrides the derived admin console link. Left empty the URL comes from the management URL, and NetBird Cloud maps to https://app.netbird.io automatically — set this only for a split dashboard host of your own."
       }
     ]
   }

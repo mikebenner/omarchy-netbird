@@ -251,6 +251,10 @@ A **PROFILES** section appears when the daemon knows more than one profile —
 with a single profile there is nothing to choose, so it stays hidden. Picking a
 row runs `netbird profile select <name>`.
 
+Both the PROFILES and NETWORKS sections disappear while a switch is in flight
+and come back when their lists have been re-read: the networks of the account
+you just left are not selectable, so they are not left on screen to be clicked.
+
 Switching re-cycles the engine, so expect a brief reconnect, and expect the
 target profile to ask for a login if its session has expired. The widget does
 not treat that as an error: the ordinary needs-login state carries it, and the
@@ -292,8 +296,28 @@ stops the daemon itself.
 
 ## Limitations
 
-Two deliberate edges in the parsing, both chosen over guessing:
+Deliberate edges, each chosen over guessing:
 
+- Retained process output is capped per stream: whole lines are dropped from
+  the front, and every failure message that reaches you — a status error, a
+  failed `up`/`down`, a networks command, a profile switch — ends with
+  `(output truncated)` when lines were dropped, so a shortened message is
+  never presented as the whole story. One thing that
+  cap cannot reach: until a newline arrives, Quickshell buffers the growing
+  line inside its own process object, and no QML-side setting bounds that. A
+  command emitting one endless unterminated line would grow that buffer for
+  as long as it runs — which is why the real ceiling is time, not memory:
+  every call is wrapped in `timeout -k 2 8` (`timeout -k 5 130` for the SSO
+  login), so the process is killed seconds in.
+
+- `netbird profile list` has no `--json` either, and its table is a
+  space-padded two-column layout, so a profile name that ends in spaces
+  cannot be told from the padding: it is read without them, and selecting it
+  fails on the daemon rather than switching to the wrong account. For the
+  same reason a line of unrecognised prose that happens to be exactly the
+  name column's width can be read as a profile; the section only appears when
+  the parse produced more than one row, and selecting such a row fails on a
+  name the daemon does not have.
 - The management-host check that stops the SSO flow opening the daemon's own
   endpoint compares ASCII hostnames. There is no IDNA canonicalisation, so an
   internationalised management URL and its punycode spelling

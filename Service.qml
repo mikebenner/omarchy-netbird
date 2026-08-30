@@ -66,14 +66,34 @@ Item {
   // Reads are ordered against writes that have COMPLETED, and never started
   // while one is in flight. Counting writes *started* let a read that began
   // mid-write match on the way out and apply a pre-write snapshot.
-  property int _networkWritesCompleted: 0
-  property int _networkReadSeq: 0
-  // Set whenever a list result is thrown away for ordering, or a scheduled
-  // re-read is refused because something was already running. Every list and
-  // action exit checks it, so no interleaving can end with stale rows on
-  // screen and nothing queued to correct them.
+  //
+  // "Write" here is any change to what a networks read would return, which
+  // includes a profile switch: it moves the whole account under the list, so
+  // a read spanning one describes networks that are no longer selectable.
+  // Counting only `networks select/deselect` let such a read pass, apply the
+  // previous account's rows, and clear the very obligation the switch queued.
+  property int _networkGeneration: 0
+  property int _networkReadGeneration: 0
+  // Set whenever a list result is thrown away for ordering, a scheduled
+  // re-read is refused because something was already running, or a corrective
+  // read fails. Cleared ONLY when a read successfully applies — clearing it
+  // when the read merely *started* let a non-zero exit strand stale rows with
+  // nothing queued. Drained through the single-shot timers below, so no
+  // interleaving can end dirty with nothing scheduled to correct it.
   property bool _networksDirty: false
   property bool _profilesDirty: false
+  // Consecutive corrective reads that failed to apply. At
+  // Model.MAX_CORRECTIVE_ATTEMPTS the obligation stops rescheduling itself
+  // and waits for a natural trigger — a panel open, an action, a daemon
+  // recovery — each of which resets the budget.
+  property int _networksAttempts: 0
+  property int _profilesAttempts: 0
+  // Refusals because another process held the gate, counted separately: they
+  // are not the daemon failing, so they get their own generous budget
+  // (Model.MAX_BUSY_REFUSALS) rather than sharing — or, as before, sharing
+  // nothing and knocking forever.
+  property int _networksBusyRefusals: 0
+  property int _profilesBusyRefusals: 0
 
   property var profiles: []
   property bool profilesLoaded: false
@@ -181,37 +201,125 @@ Item {
     pollWatchdog.restart()
   }
 
+  // --- corrective list reads ------------------------------------------------
+  //
+  // Networks and profiles have the same lifecycle: a write makes the displayed
+  // list stale, the obligation to re-read it survives everything except a read
+  // that actually applies, and the retries are bounded. They used to be
+  // written out twice and had already drifted apart — the networks path
+  // charged ordering discards against the failure budget, the profiles path
+  // charged an empty parse — so both now go through the one set of functions
+  // below and the one decision table in `Model.correctiveStep`.
+  //
+  // `kind` is "networks" or "profiles". The two branches inside each function
+  // are property access, nothing more; every rule lives in the model.
+
+  function _correctiveState(kind) {
+    return kind === "profiles"
+      ? { attempts: _profilesAttempts, busy: _profilesBusyRefusals }
+      : { attempts: _networksAttempts, busy: _networksBusyRefusals }
+  }
+
+  // Record what an attempt came to, store the next state, and schedule the
+  // retry the model asked for — a retry of 0 means "arm nothing": either
+  // nothing is owed, or the obligation is waiting on the state hooks below.
+  // Returns true only for a read that applied, so the refusal paths can
+  // `return _noteCorrective(...)` and still answer false to their caller.
+  function _noteCorrective(kind, outcome) {
+    var next = Model.correctiveStep(outcome, _correctiveState(kind))
+    if (kind === "profiles") {
+      _profilesAttempts = next.attempts
+      _profilesBusyRefusals = next.busy
+      _profilesDirty = next.dirty
+      if (next.retryMs > 0) {
+        profilesDirtyDrain.interval = next.retryMs
+        profilesDirtyDrain.restart()
+      }
+    } else {
+      _networksAttempts = next.attempts
+      _networksBusyRefusals = next.busy
+      _networksDirty = next.dirty
+      if (next.retryMs > 0) {
+        networksDirtyDrain.interval = next.retryMs
+        networksDirtyDrain.restart()
+      }
+    }
+    return outcome === Model.CORRECTIVE_APPLIED
+  }
+
+  // A natural trigger — the panel opening, an action completing, the daemon
+  // coming back. Both lists owe a fresh read and both budgets start over.
+  function requestLists() {
+    requestList("networks")
+    requestList("profiles")
+  }
+
+  function requestList(kind) {
+    if (kind === "profiles") {
+      _profilesDirty = true
+      _profilesAttempts = 0
+      _profilesBusyRefusals = 0
+      profilesDirtyDrain.interval = Model.CORRECTIVE_PROMPT_MS
+      profilesDirtyDrain.restart()
+    } else {
+      _networksDirty = true
+      _networksAttempts = 0
+      _networksBusyRefusals = 0
+      networksDirtyDrain.interval = Model.CORRECTIVE_PROMPT_MS
+      networksDirtyDrain.restart()
+    }
+  }
+
+  // Start the read a refusal, a discard or a failed corrective read owes us.
+  // Reached only through the drain timers — never straight from an exit
+  // handler — so a failing daemon is retried on a cadence, not in a tight
+  // exit-restart loop.
+  function _drainList(kind) {
+    if (kind === "profiles") {
+      if (!_profilesDirty) return
+      refreshProfiles()
+    } else {
+      if (!_networksDirty) return
+      refreshNetworks()
+    }
+  }
+
+  // The state hooks. A refusal for a state reason arms no timer — re-asking a
+  // state that only an event can change is a loop with nothing to gain — so
+  // the transition that unblocks it is what re-arms the drain. Without these
+  // the obligation stayed set with nothing scheduled, and the section it owned
+  // (PROFILES, after the loaded-gate went in) never came back that session.
+  onPanelOpenChanged: if (panelOpen) requestLists()
+  onDaemonDownChanged: if (!daemonDown && panelOpen) requestLists()
+  onRunningChanged: if (running && panelOpen) requestLists()
+  onInstalledChanged: if (installed && panelOpen) requestLists()
+
   // --- networks -------------------------------------------------------------
 
+  // A profile switch recycles the engine onto another account, so it
+  // invalidates a networks read exactly as a networks write does: the rows in
+  // flight describe the account we just left. Both kinds of write are
+  // therefore counted in the same generation, and neither lets a read start.
+  readonly property bool _networkWriteInFlight: networkActionProcess.running || profileActionProcess.running
+
   function refreshNetworks() {
-    if (!installed || daemonDown || !running || !panelOpen) return false
-    // Never read across a write. Refusing here is safe only because the refusal
-    // is recorded: the next exit that finds nothing running starts the read.
-    if (!Model.canStartNetworksRead(networkActionProcess.running, networksProcess.running)) {
-      _networksDirty = true
-      return false
+    // State reasons: nothing to retry against, and nothing charged. The hooks
+    // above re-arm the drain when the state that blocked it changes.
+    if (!installed || daemonDown || !running || !panelOpen) return _noteCorrective("networks", Model.CORRECTIVE_BLOCKED)
+    // Never read across a write. Refusing here is safe only because the
+    // refusal is recorded and rescheduled — and bounded, so a process that
+    // never exits cannot leave the drain knocking forever.
+    if (!Model.canStartNetworksRead(_networkWriteInFlight, networksProcess.running)) {
+      return _noteCorrective("networks", Model.CORRECTIVE_BUSY)
     }
-    _networksDirty = false
-    _networkReadSeq = _networkWritesCompleted
+    // The dirty bit is NOT cleared here. Starting a read fulfils nothing;
+    // only its successful apply in onExited does.
+    _networkReadGeneration = _networkGeneration
     networksStdout.reset()
     networksStderr.reset()
     networksProcess.command = Model.networksListCommand()
     networksProcess.running = true
     return true
-  }
-
-  // Start the read a refusal or a discard owed us, the moment nothing is in
-  // the way. Called from every list and action exit.
-  function _drainNetworksDirty() {
-    if (!_networksDirty) return
-    if (!Model.canStartNetworksRead(networkActionProcess.running, networksProcess.running)) return
-    refreshNetworks()
-  }
-
-  function _drainProfilesDirty() {
-    if (!_profilesDirty) return
-    if (profilesProcess.running || profileActionProcess.running) return
-    refreshProfiles()
   }
 
   function networkSelected(id) {
@@ -269,12 +377,13 @@ Item {
   // --- profiles -------------------------------------------------------------
 
   function refreshProfiles() {
-    if (!installed || daemonDown || !panelOpen) return false
+    // `profile list` reads the on-disk profiles, so it does not need the
+    // tunnel up — only a daemon to answer and someone looking.
+    if (!installed || daemonDown || !panelOpen) return _noteCorrective("profiles", Model.CORRECTIVE_BLOCKED)
     if (profilesProcess.running || profileActionProcess.running) {
-      _profilesDirty = true
-      return false
+      return _noteCorrective("profiles", Model.CORRECTIVE_BUSY)
     }
-    _profilesDirty = false
+    // Not cleared here — only a successful apply in onExited clears it.
     profilesStdout.reset()
     profilesStderr.reset()
     profilesProcess.command = Model.profileListCommand()
@@ -291,6 +400,11 @@ Item {
   function selectProfile(name) {
     var target = String(name || "")
     if (target === "" || target === activeProfile()) return false
+    // The belt behind the parser: only a name from the most recently APPLIED
+    // parsed list may be selected. Whatever a hostile or future table might
+    // sneak past the parse rules, it cannot be handed to `profile select`
+    // unless it is one of the rows on screen.
+    if (!Model.isKnownProfile(profiles, target)) return false
     // Serialised against every other command: switching recycles the engine,
     // so it must not overlap a toggle, a login, or a network change — and a
     // stale list must not be the thing being selected from.
@@ -322,11 +436,6 @@ Item {
     if (url === "") return false
     Quickshell.execDetached(["omarchy-launch-browser", url])
     return true
-  }
-
-  function elideStatus(text) {
-    var value = String(text || "").replace(/\s+/g, " ").trim()
-    return value.length > 140 ? value.substring(0, 137) + "…" : value
   }
 
   // The daemon did not answer. Keep saying so, clear everything that came from
@@ -390,10 +499,6 @@ Item {
       return
     }
 
-    // A panel held open across a recovery kept the empty list resetUnavailable
-    // installed, because opening was the only trigger. Notice the transition.
-    var cameBack = (!running && parsed.running) || (daemonDown && parsed.running)
-
     daemonStatus = parsed.daemonStatus
     running = parsed.running
     // Reality caught up to the pending toggle — stop overriding.
@@ -431,10 +536,10 @@ Item {
       loginCode = ""
       loginTimeoutTimer.stop()
     }
-    if (cameBack && panelOpen) {
-      networksRefreshDelay.restart()
-      refreshProfiles()
-    }
+    // A panel held open across a recovery used to keep the empty list
+    // `resetUnavailable` installed, because opening was the only trigger.
+    // The transition itself is now the trigger: assigning `running` and
+    // `daemonDown` above fires the state hooks, which re-arm both drains.
     // `_loginUrlOpened` is deliberately NOT cleared here. It is owned by the
     // login attempt — set when the browser opens, reset only by `up()` and
     // `cancelLogin()`. Clearing it on a successful poll let a refresh that
@@ -750,13 +855,14 @@ Item {
       var salvaged = Model.parseStatus(stdout, Date.now())
       if (salvaged.ok && !salvaged.unavailable) {
         root.parseStatus(stdout)
-        root.lastError = root.elideStatus(stderr)
+        root.lastError = Model.failureText(stderr, "", "", statusStderr.truncated)
         return
       }
       root.resetUnavailable("Disconnected")
       // Whatever the CLI did say is the only explanation the user gets, and it
-      // is as likely to be on stdout as on stderr.
-      root.lastError = root.elideStatus(stderr || stdout)
+      // is as likely to be on stdout as on stderr — noting, as every failure
+      // path here does, when the collector had to drop lines to stay bounded.
+      root.lastError = Model.failureText(stderr, stdout, "", statusStderr.truncated || statusStdout.truncated)
     }
   }
 
@@ -769,24 +875,30 @@ Item {
     onExited: function(exitCode) {
       // Discard a read that started before the most recent write: it describes
       // a selection the user has already changed, and applying it would flip
-      // the row back under them.
-      // Ordered against completed writes, and rejected outright if a write
-      // started while this read was in flight.
-      if (!Model.shouldApplyNetworksRead(root._networkReadSeq, root._networkWritesCompleted, networkActionProcess.running)) {
-        // Discarded — so the rows on screen are stale and something must go
-        // back for the truth.
-        root._networksDirty = true
-        root._drainNetworksDirty()
+      // the row back under them. Ordered against completed writes — network
+      // writes and profile switches alike — and rejected outright if either
+      // kind started while this read was in flight.
+      if (!Model.shouldApplyNetworksRead(root._networkReadGeneration, root._networkGeneration, root._networkWriteInFlight)) {
+        // A discard is not a fault: it is the race this ordering exists to
+        // catch, self-correcting one prompt re-read later. Charging it
+        // against the failure budget let an active user spend three clicks
+        // and lose the corrective read entirely.
+        root._noteCorrective("networks", Model.CORRECTIVE_DISCARDED)
         return
       }
       if (exitCode !== 0) {
-        root._drainNetworksDirty()
+        // The rows on screen are stale and the daemon would not say
+        // otherwise. Count the attempt; while under the cap the drain timer
+        // goes back for the truth, and past it the obligation waits for the
+        // next natural trigger instead of looping.
+        root._noteCorrective("networks", Model.CORRECTIVE_FAILED)
         return
       }
       root.networks = Model.parseNetworksList(String(networksStdout.tail || ""))
       root.networksLoaded = true
       root.networkDesired = {}
-      root._drainNetworksDirty()
+      // Applied: this is the only place the obligation is fulfilled.
+      root._noteCorrective("networks", Model.CORRECTIVE_APPLIED)
     }
   }
 
@@ -797,13 +909,22 @@ Item {
     stdout: BoundedCollector { id: profilesStdout; limit: 16384 }
     stderr: BoundedCollector { id: profilesStderr; limit: 16384 }
     onExited: function(exitCode) {
-      if (exitCode !== 0) {
-        root._drainProfilesDirty()
+      // "Applied" means the CLI exited 0 and what it printed was the table we
+      // asked for. It does NOT mean the table had rows: an empty parse used
+      // to be treated as a failure, on the theory that there is always a
+      // default profile — which turned any format drift into the section
+      // disappearing plus three spawns per trigger. A parsed table with no
+      // rows is an answer, so it is applied.
+      var parsed = exitCode === 0
+        ? Model.parseProfileTable(String(profilesStdout.tail || ""))
+        : { ok: false, profiles: [] }
+      if (!parsed.ok) {
+        root._noteCorrective("profiles", Model.CORRECTIVE_FAILED)
         return
       }
-      root.profiles = Model.parseProfileList(String(profilesStdout.tail || ""))
+      root.profiles = parsed.profiles
       root.profilesLoaded = true
-      root._drainProfilesDirty()
+      root._noteCorrective("profiles", Model.CORRECTIVE_APPLIED)
     }
   }
 
@@ -815,22 +936,30 @@ Item {
     stderr: BoundedCollector { id: profileActionStderr; limit: 16384 }
     onExited: function(exitCode) {
       if (exitCode !== 0) {
-        root.lastError = root.elideStatus(
-          String(profileActionStderr.tail || "") || String(profileActionStdout.tail || "") || "netbird profile select failed")
+        root.lastError = Model.failureText(profileActionStderr.tail, profileActionStdout.tail,
+          "netbird profile select failed", profileActionStderr.truncated || profileActionStdout.truncated)
         root.actionStatus = root.lastError
         actionStatusTimer.restart()
       } else {
         root.actionStatus = ""
       }
+      // The switch has landed, so a networks read may be trusted again — and
+      // any read still in flight belongs to the account we just left. Same
+      // generation as a networks write, for exactly that reason.
+      root._networkGeneration += 1
       // Switching profiles re-cycles the engine: the daemon may come back
       // needing a login on the target profile. Let the ordinary states carry
-      // whatever it reports.
+      // whatever it reports. Both lists belong to the old account until they
+      // are re-read, so both are dropped rather than left on screen: the
+      // networks of an account this machine is no longer on are not
+      // selectable, and clicking one would send an id from it.
       root.profilesLoaded = false
-      root._profilesDirty = true
-      root._networksDirty = true
+      root.networksLoaded = false
+      root.networks = []
+      root.networkDesired = {}
+      // An action is a natural trigger: fresh budgets, both lists owed.
+      root.requestLists()
       delayedRefresh.restart()
-      networksRefreshDelay.restart()
-      root._drainProfilesDirty()
     }
   }
 
@@ -843,24 +972,37 @@ Item {
     onExited: function(exitCode) {
       if (exitCode !== 0) {
         root.networkDesired = {}
-        root.lastError = root.elideStatus(
-          String(networkActionStderr.tail || "") || String(networkActionStdout.tail || "") || "netbird networks command failed")
+        root.lastError = Model.failureText(networkActionStderr.tail, networkActionStdout.tail,
+          "netbird networks command failed", networkActionStderr.truncated || networkActionStdout.truncated)
         root.actionStatus = root.lastError
         actionStatusTimer.restart()
       }
       // The write is done: from here a read can be trusted again.
-      root._networkWritesCompleted += 1
-      // Re-read either way: on success to see it, on failure to see the truth.
-      root._networksDirty = true
-      networksRefreshDelay.restart()
+      root._networkGeneration += 1
+      // Re-read either way: on success to see it, on failure to see the
+      // truth. A completed action is a natural trigger — fresh retry budget.
+      root.requestList("networks")
     }
   }
 
+  // The dirty drains. Deliberately timers, not calls from exit handlers: a
+  // daemon refusing every list would otherwise be retried the instant each
+  // failure landed, in a tight exit-restart loop. The interval is whatever
+  // `Model.correctiveStep` asked for — the slow cadence after a fault, the
+  // prompt one after a discard or a natural trigger — so it is set on every
+  // arm rather than declared once.
   Timer {
-    id: networksRefreshDelay
-    interval: 400
+    id: networksDirtyDrain
+    interval: Model.CORRECTIVE_RETRY_MS
     repeat: false
-    onTriggered: root.refreshNetworks()
+    onTriggered: root._drainList("networks")
+  }
+
+  Timer {
+    id: profilesDirtyDrain
+    interval: Model.CORRECTIVE_RETRY_MS
+    repeat: false
+    onTriggered: root._drainList("profiles")
   }
 
   Timer {
@@ -884,8 +1026,8 @@ Item {
       var stderr = String(actionStderr.tail || "")
       if (exitCode !== 0) {
         root._desired = -1
-        root.lastError = root.elideStatus(stderr || stdout || "netbird command failed")
-        if (actionStderr.truncated || actionStdout.truncated) root.lastError += " (output truncated)"
+        root.lastError = Model.failureText(stderr, stdout, "netbird command failed",
+          actionStderr.truncated || actionStdout.truncated)
         root.actionStatus = root.lastError
         actionStatusTimer.restart()
       } else {
@@ -919,7 +1061,7 @@ Item {
       if (exitCode !== 0 && !opened) {
         root._desired = -1
         root._loginInProgress = false
-        root.lastError = root.elideStatus(combined || "netbird up failed")
+        root.lastError = Model.failureText(combined, "", "netbird up failed", false)
         root.actionStatus = root.lastError
         actionStatusTimer.restart()
       } else if (!opened) {

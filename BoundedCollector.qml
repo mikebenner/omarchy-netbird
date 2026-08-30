@@ -2,32 +2,60 @@ import QtQuick
 import Quickshell.Io
 import "Model.js" as Model
 
-// A process-output collector whose memory is bounded *while* collecting, and
-// whose result is complete by the time `Process.exited` runs.
+// A process-output collector whose *retained* text is bounded, and whose
+// result is complete by the time `Process.exited` runs.
 //
 // Completeness — settled from the quickshell source, not assumed
 // -------------------------------------------------------------
-// quickshell v0.3.1 (the installed version), `src/io/process.cpp`,
-// `Process::onFinished` at lines 274-286:
+// Cited against the installed version, quickshell 0.3.1, at the tag rather
+// than a branch, so the quotes below can be checked as written:
 //
-//     if (this->mStdoutParser) this->mStdoutParser->streamEnded(this->stdoutBuffer);
-//     if (this->mStderrParser) this->mStderrParser->streamEnded(this->stderrBuffer);
-//     ...
-//     emit this->exited(exitCode, exitStatus);
+//   https://github.com/quickshell-mirror/quickshell/blob/v0.3.1/src/io/process.cpp#L274-L287
+//   https://github.com/quickshell-mirror/quickshell/blob/v0.3.1/src/io/datastream.cpp#L101-L103
 //
-// and `src/io/datastream.cpp`, `SplitParser::streamEnded` at lines 101-103:
+// The line numbers in this file's own history were wrong — earlier revisions
+// cited `process.cpp:254-266` and `datastream.cpp:39-96`, which at that tag
+// are `Process::onFinished`'s neighbours and `DataStream::onBytesAvailable`,
+// not the code that carries the guarantee. Those numbers were carried forward
+// from review to review without being re-fetched. The two lines that actually
+// carry it, quoted so they can be found even if the numbering shifts again:
 //
-//     if (!buffer.isEmpty()) emit this->read(QString(buffer));
+//   process.cpp:277   if (this->mStdoutParser) this->mStdoutParser->streamEnded(this->stdoutBuffer);
+//   process.cpp:282   emit this->exited(exitCode, exitStatus);
 //
-// So every whole line has already been delivered by `parseBytes` as it
-// arrived, the trailing partial line is flushed by `streamEnded`, and only
-// then is `exited` emitted. A `SplitParser` therefore *has* a completeness
-// guarantee — it is expressed as ordering rather than as a signal, which is
-// why the type carries no `waitForEnd`. `tail` is final in the exit handler.
+// `Process::onFinished` (`process.cpp:274-287`) runs in that order: it clears
+// the running process, calls `streamEnded` on the stdout parser and then the
+// stderr one (`:277-278`), and only after that emits `exited` (`:282`).
+//
+// And the flush those calls perform, `datastream.cpp:101-103` in full:
+//
+//   void SplitParser::streamEnded(QByteArray& buffer) {
+//       if (!buffer.isEmpty()) emit this->read(QString(buffer));
+//   }
+//
+// Whole lines are already delivered as they arrive — `SplitParser::parseBytes`
+// (`datastream.cpp:43-99`) emits each delimiter-terminated chunk at `:85` — so
+// between the two, every line plus the trailing partial one has been handed to
+// `onRead` before `exited` fires. A `SplitParser` therefore *has* a
+// completeness guarantee; it is expressed as ordering rather than as a signal,
+// which is why the type carries no `waitForEnd`. `tail` is final in the exit
+// handler.
 //
 // That settles the question that made an earlier revision fall back to
-// `StdioCollector`: there is no need to trade bounded memory for completeness,
-// so the streaming design is used for every process here.
+// `StdioCollector`: there is no need to trade bounded retention for
+// completeness, so the streaming design is used for every process here.
+//
+// What `limit` does NOT bound — and what actually does
+// ----------------------------------------------------
+// `limit` caps only the text this component retains across lines. The
+// per-line buffer lives inside quickshell itself: with no delimiter in the
+// incoming bytes, `parseBytes` appends them to the Process-owned buffer and
+// emits nothing (`datastream.cpp:91-92`, `buffer.append(incoming)`), so a
+// single line with no newline grows that buffer for as long as the stream
+// runs — and nothing reachable from QML can cap it. The real ceiling on such
+// a producer is time, not memory: every command here is argv `timeout -k 2 8`
+// (`timeout -k 5 130` for login), so an endless unterminated line is cut off
+// when its process is killed, at most seconds in.
 //
 // What is kept
 // ------------

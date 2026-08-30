@@ -904,6 +904,31 @@ function trimToLimit(text, limit) {
   return value.substring(cut)
 }
 
+// --- failure messages -------------------------------------------------------
+//
+// Whatever the CLI said is the only explanation the user gets, so it is
+// squashed onto one line and elided rather than dropped. And when the
+// collector had to drop lines to stay bounded, the message says so: a
+// truncated message presented as the whole story is how a reader concludes
+// the wrong thing about a failure. Every failing path here — status, the
+// tunnel action, the network write, the profile switch — reports through
+// this, which is what makes the README's claim true.
+var MESSAGE_ELIDE_LIMIT = 140
+var TRUNCATION_NOTE = "(output truncated)"
+
+function elideMessage(text) {
+  var value = String(text === undefined || text === null ? "" : text).replace(/\s+/g, " ").trim()
+  return value.length > MESSAGE_ELIDE_LIMIT ? value.substring(0, MESSAGE_ELIDE_LIMIT - 3) + "…" : value
+}
+
+function failureText(primary, secondary, fallback, truncated) {
+  var message = elideMessage(primary)
+  if (message === "") message = elideMessage(secondary)
+  if (message === "") message = elideMessage(fallback)
+  if (truncated !== true) return message
+  return message === "" ? TRUNCATION_NOTE : message + " " + TRUNCATION_NOTE
+}
+
 // --- networks read/write ordering -------------------------------------------
 //
 // A list read is only trustworthy if no write happened between its start and
@@ -924,6 +949,107 @@ function shouldApplyNetworksRead(capturedCompletions, currentCompletions, writeI
   return Number(capturedCompletions) === Number(currentCompletions)
 }
 
+// --- corrective reads -------------------------------------------------------
+//
+// After a write, the displayed model is stale until a fresh read lands. That
+// obligation ("dirty") must survive a read that *fails*, which is where an
+// earlier version lost it: the bit was cleared when the corrective read
+// started, so a non-zero exit left stale rows with nothing queued.
+//
+// Not every unsuccessful attempt means the same thing, though, and folding
+// them into one "failed" branch cost the widget twice. An ordering discard —
+// a self-correcting race this code creates on purpose — was charged against
+// the failure budget and delayed two seconds. A refusal because another
+// process held the gate was charged nothing at all and could knock forever.
+// And a refusal for a *state* reason (no daemon, tunnel down, panel closed)
+// re-armed nothing, so the obligation stayed set with nothing scheduled and
+// the section it owned never came back for the rest of the session.
+//
+// So an attempt reports one of five outcomes and this decides what follows:
+//
+//   applied    the read landed and replaced the model. Obligation fulfilled,
+//              budget restored.
+//   failed     a nonzero exit, or output that is not the document we asked
+//              for. Charges the failure budget and retries on the slow
+//              cadence; once the budget is out the obligation is dropped and
+//              waits for a natural trigger — panel open, an action, a daemon
+//              recovery — each of which restores the budget.
+//   discarded  a result thrown away because a write overtook it. Not a
+//              failure: the truth is one prompt re-read away, and charging it
+//              would let an active user exhaust the budget on a race the code
+//              deliberately allows.
+//   busy       refused because another process held the gate. Its own,
+//              deliberately generous budget — but a budget, because an
+//              unbounded knock is a timer loop with no end.
+//   blocked    refused for a state reason. There is nothing to retry against:
+//              a timer would only re-ask a state that only an event changes.
+//              The obligation stands, charges nothing, and is re-armed by the
+//              hook on the state that unblocks it (daemon back, tunnel up,
+//              panel opened, CLI found).
+var MAX_CORRECTIVE_ATTEMPTS = 3
+// ~30 knocks on the slow cadence is a minute of "something else is running",
+// far past any command here: every one is wrapped in `timeout -k 2 8`, or
+// `timeout -k 5 130` for the SSO login.
+var MAX_BUSY_REFUSALS = 30
+// Long enough for an engine recycle to settle, short enough that a corrected
+// list is on screen before anyone wonders.
+var CORRECTIVE_RETRY_MS = 2000
+// A discard is not a fault, so it is not made to wait like one.
+var CORRECTIVE_PROMPT_MS = 250
+
+var CORRECTIVE_APPLIED = "applied"
+var CORRECTIVE_FAILED = "failed"
+var CORRECTIVE_DISCARDED = "discarded"
+var CORRECTIVE_BUSY = "busy"
+var CORRECTIVE_BLOCKED = "blocked"
+
+function nonNegativeCount(value) {
+  var n = parseInt(String(value), 10)
+  return !isFinite(n) || n < 0 ? 0 : n
+}
+
+// `state` is `{ attempts, busy }`; the result carries the whole next state
+// plus what the caller should schedule. `retryMs === 0` means "arm no timer":
+// either nothing is owed, or the obligation is waiting on a state hook or the
+// next natural trigger instead. Both list paths — networks and profiles — go
+// through this one function, so they cannot drift apart again.
+function correctiveStep(outcome, state) {
+  var attempts = nonNegativeCount(state ? state.attempts : 0)
+  var busy = nonNegativeCount(state ? state.busy : 0)
+
+  if (outcome === CORRECTIVE_APPLIED) {
+    return { dirty: false, attempts: 0, busy: 0, retryMs: 0, waitForState: false }
+  }
+  if (outcome === CORRECTIVE_DISCARDED) {
+    return { dirty: true, attempts: attempts, busy: busy, retryMs: CORRECTIVE_PROMPT_MS, waitForState: false }
+  }
+  if (outcome === CORRECTIVE_BLOCKED) {
+    return { dirty: true, attempts: attempts, busy: busy, retryMs: 0, waitForState: true }
+  }
+  if (outcome === CORRECTIVE_BUSY) {
+    var nextBusy = busy + 1
+    var keepKnocking = nextBusy < MAX_BUSY_REFUSALS
+    return {
+      dirty: keepKnocking,
+      attempts: attempts,
+      busy: nextBusy,
+      retryMs: keepKnocking ? CORRECTIVE_RETRY_MS : 0,
+      waitForState: false
+    }
+  }
+  // CORRECTIVE_FAILED — and any outcome this function does not know, since
+  // spending the budget is the conservative direction for an unknown.
+  var nextAttempts = attempts + 1
+  var keepTrying = nextAttempts < MAX_CORRECTIVE_ATTEMPTS
+  return {
+    dirty: keepTrying,
+    attempts: nextAttempts,
+    busy: busy,
+    retryMs: keepTrying ? CORRECTIVE_RETRY_MS : 0,
+    waitForState: false
+  }
+}
+
 // --- profiles ---------------------------------------------------------------
 
 // `netbird profile list` prints a two-column table:
@@ -934,14 +1060,86 @@ function shouldApplyNetworksRead(capturedCompletions, currentCompletions, writeI
 // The header is required. Without it we are looking at a warning, an error, or
 // a future format — and turning arbitrary lines into profiles would put rows in
 // the switcher that run `netbird profile select <that line>` when clicked.
-var PROFILE_HEADER = /^(\s*)NAME(\s+)ACTIVE\s*$/
+// Derived from the upstream printer, netbird v0.77.1 `client/cmd/profile.go`:
+//
+//     tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)   // :114
+//     fmt.Fprintln(tw, "NAME\tACTIVE")                                // :118
+//     marker := ""; if profile.IsActive { marker = "✓" }              // :121-124
+//     fmt.Fprintf(tw, "%s\t%s\n", name, marker)                      // :130
+//
+// Four facts fall out of that, and every geometry rule below is one of them.
+// All four were verified by running Go's tabwriter with those exact
+// parameters, not just read off the docs:
+//
+//   1. padding is 2 and padchar is a space, so tabwriter puts *at least two*
+//      spaces between the columns. A header with a single space is not output
+//      this printer can produce, and every name is followed by at least two
+//      spaces — the column is the widest cell plus the padding.
+//   2. tabwriter pads every cell in a column to the same width, header
+//      included, so the ACTIVE column starts at the same offset on every line
+//      and a name can never overrun into it — the column widens instead.
+//   3. the ACTIVE cell is `marker`, which today is exactly "✓" or exactly "".
+//   4. tabwriter does not pad the *trailing* cell of a line, and it does pad
+//      the name cell even when the marker after it is empty. So an inactive
+//      row is exactly the column width — name plus trailing spaces, nothing
+//      after it — and an active row is that plus a marker beginning on the
+//      boundary. Nothing this printer emits has whitespace past the column.
+//
+// Rule 4 is what rejects both a line too short to reach the column and one
+// that reaches it with only whitespace beyond ("WARNING oops  ").
+//
+// What geometry alone cannot reject is a line of prose that happens to align
+// ("WARNING x     danger"): it is the same shape as a row. Rule 3 used to be
+// asked to do that job — an unrecognised marker dropped the row — but that
+// makes the widget lose real profiles the day upstream changes "✓" to
+// anything else, including the active one. So an unrecognised marker is now
+// *kept*, treated as active (see below), and aligned prose is rejected by
+// what it says instead: PROFILE_NON_ROW.
+//
+// The residual, stated plainly: a line under the header that is exactly the
+// column width and opens with none of those words — "looks fine    " — is
+// indistinguishable from an inactive profile of that name, and this parser
+// accepts it. `isKnownProfile` is no defence, since it re-checks the same
+// parse. The consequences are bounded: such a row can only ever run
+// `netbird profile select "looks fine"`, which fails on a name the daemon
+// does not have, and the section only appears at all when the parse produced
+// more than one row.
+//
+// Names come from StripCtrlChars(profile.Name) (:125), so they may contain
+// spaces and non-ASCII but no control characters. One deliberate edge:
+// tabwriter measures cells in runes while this parser slices UTF-16 code
+// units, so a name carrying astral-plane characters (each one rune but two
+// code units) can put the boundary mid-name. Such a row fails the padding
+// check and is dropped — the safe direction: a profile that does not appear
+// can never be mis-selected, and no phantom row is invented.
+var PROFILE_HEADER = /^NAME(\s{2,})ACTIVE\s*$/
+var PROFILE_ACTIVE_MARKER = "✓"
+// Lines the CLI, or a library under it, prints that are not table rows. A
+// profile genuinely named "info" is dropped by this; that is the safe
+// direction — a row that does not appear cannot be mis-selected, while a
+// phantom one runs `profile select` against the daemon.
+var PROFILE_NON_ROW = /^\s*[[(]?\s*(?:warn|warning|error|err|erro|info|debug|trace|fatal|panic|usage|note|hint)\b/i
+// A logrus/zap style timestamped log line, whatever severity follows it.
+var PROFILE_TIMESTAMPED = /^\s*\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}/
 
-// Read by the header's column geometry, not by splitting on whitespace.
-// Profile names are free-form — `Work Account` and `büro` are both legal — so
-// taking the first whitespace-delimited token truncated one and dropped the
-// other. The ACTIVE column starts at a fixed offset the header itself declares;
-// everything left of it is the name.
-function parseProfileList(raw) {
+// tabwriter pads a name cell with spaces, and a name may itself end in
+// spaces: `"Work "` and `"Work"` are printed identically, so the padding
+// cannot be told from the name. Trailing spaces are therefore unrecoverable
+// from this format — a profile named `"Work "` parses as `"Work"`, and a
+// select on it will be refused by the daemon rather than silently switching
+// to the wrong account. What must not happen is the two sides disagreeing, so
+// every place a name is compared or sent goes through this one
+// normalisation: the parse, `isKnownProfile`, and the argv in
+// `profileSelectCommand`.
+function normalizeProfileName(name) {
+  return String(name === undefined || name === null ? "" : name).replace(/\s+$/, "")
+}
+
+// Returns `{ ok, profiles }`. `ok` is false only when the output was not the
+// table we asked for — no header. A header with no rows under it is `ok` with
+// an empty list, which the caller applies: treating an empty parse as a read
+// failure turned any format drift into total feature loss plus a retry storm.
+function parseProfileTable(raw) {
   var text = String(raw === undefined || raw === null ? "" : raw)
   var lines = text.split(/\r?\n/)
 
@@ -951,31 +1149,68 @@ function parseProfileList(raw) {
     var header = lines[i].match(PROFILE_HEADER)
     if (!header) continue
     headerAt = i
-    activeAt = header[1].length + "NAME".length + header[2].length
+    activeAt = "NAME".length + header[1].length
     break
   }
-  if (headerAt === -1) return []
+  if (headerAt === -1) return { ok: false, profiles: [] }
 
   var profiles = []
   for (var j = headerAt + 1; j < lines.length; j++) {
     var line = lines[j]
     if (line.trim() === "") continue
-    // A row has to reach the ACTIVE column to be a row at all. A trailing
-    // "WARNING failed to read cache" is shorter than the table is wide, so it
-    // is discarded rather than becoming a selectable profile.
+    // Not geometry — what the line says. The only defence against prose that
+    // happens to align with the column.
+    if (PROFILE_NON_ROW.test(line) || PROFILE_TIMESTAMPED.test(line)) continue
+
+    // Rule 4: every row reaches the ACTIVE column, trailing padding and all.
     if (line.length < activeAt) continue
     var namePart = line.substring(0, activeAt)
-    // The name column is padded, so a real row always has whitespace where the
-    // ACTIVE column begins. That single check is what separates a row from a
-    // trailing "WARNING failed to read cache", whose words run straight
-    // through the column boundary.
-    if (!/\s$/.test(namePart)) continue
-    var name = namePart.replace(/\s+$/, "")
-    if (name === "" || /^\s/.test(name)) continue
-    var cell = line.substring(activeAt).trim()
+    var cell = line.substring(activeAt)
+
+    // Rule 4 again: the trailing cell is written straight onto the boundary
+    // and never padded, so a row is either exactly the column width (cell
+    // "") or the width plus a marker starting on it. Whitespace past the
+    // column is not output this printer can produce.
+    if (cell !== "" && /^\s/.test(cell)) continue
+
+    // Rule 1/2: the name column is padded to the widest name plus two, so a
+    // row's name always ends in at least two spaces before the boundary.
+    // Prose runs straight through it.
+    if (!/\s\s$/.test(namePart)) continue
+
+    var name = normalizeProfileName(namePart)
+    // tabwriter writes the first cell at column zero, so a row never begins
+    // with whitespace; and an empty name is not a profile.
+    if (name === "" || /^\s/.test(namePart)) continue
+
+    // Rule 3, held loosely on purpose. "✓" is what v0.77.1 writes, but the
+    // cell is only ever *empty* for an inactive profile, so any non-empty
+    // marker means active. Reading an unknown marker as inactive would be
+    // worse than reading it as active: with no row marked active,
+    // `activeProfile()` returns "" and the panel offers a select of the
+    // profile already in use — and a select recycles the engine.
     profiles.push({ name: name, active: cell !== "" })
   }
-  return profiles
+  return { ok: true, profiles: profiles }
+}
+
+function parseProfileList(raw) {
+  return parseProfileTable(raw).profiles
+}
+
+// The belt on top of the parser: `profile select` may only ever be handed a
+// name that the most recently *applied* parse produced. Even if a hostile or
+// future table slipped a row past the rules above, nothing outside this list
+// is selectable. Both sides are normalised the same way the argv is, so the
+// check and the command can never disagree about what the name is.
+function isKnownProfile(profiles, name) {
+  var target = normalizeProfileName(name)
+  if (target === "") return false
+  var list = profiles || []
+  for (var i = 0; i < list.length; i++) {
+    if (list[i] && normalizeProfileName(list[i].name) === target) return true
+  }
+  return false
 }
 
 function profileListCommand() {
@@ -983,8 +1218,10 @@ function profileListCommand() {
 }
 
 function profileSelectCommand(name) {
+  // The same normalisation `isKnownProfile` checks against, so what was
+  // approved is exactly what is sent.
   return timeoutPrefix(DAEMON_TIMEOUT_SEC, DAEMON_KILL_GRACE_SEC)
-    .concat(["netbird", "profile", "select", String(name)])
+    .concat(["netbird", "profile", "select", normalizeProfileName(name)])
 }
 
 // --- peer actions -----------------------------------------------------------
@@ -1150,6 +1387,18 @@ if (typeof module !== "undefined") {
     hostKey: hostKey,
     trimUrlPunctuation: trimUrlPunctuation,
     trimToLimit: trimToLimit,
+    elideMessage: elideMessage,
+    failureText: failureText,
+    correctiveStep: correctiveStep,
+    MAX_CORRECTIVE_ATTEMPTS: MAX_CORRECTIVE_ATTEMPTS,
+    MAX_BUSY_REFUSALS: MAX_BUSY_REFUSALS,
+    CORRECTIVE_RETRY_MS: CORRECTIVE_RETRY_MS,
+    CORRECTIVE_PROMPT_MS: CORRECTIVE_PROMPT_MS,
+    CORRECTIVE_APPLIED: CORRECTIVE_APPLIED,
+    CORRECTIVE_FAILED: CORRECTIVE_FAILED,
+    CORRECTIVE_DISCARDED: CORRECTIVE_DISCARDED,
+    CORRECTIVE_BUSY: CORRECTIVE_BUSY,
+    CORRECTIVE_BLOCKED: CORRECTIVE_BLOCKED,
     parseStatus: parseStatus,
     extractAuthUrl: extractAuthUrl,
     loginProgress: loginProgress,
@@ -1176,6 +1425,9 @@ if (typeof module !== "undefined") {
     canStartNetworksRead: canStartNetworksRead,
     shouldApplyNetworksRead: shouldApplyNetworksRead,
     parseProfileList: parseProfileList,
+    parseProfileTable: parseProfileTable,
+    normalizeProfileName: normalizeProfileName,
+    isKnownProfile: isKnownProfile,
     profileListCommand: profileListCommand,
     profileSelectCommand: profileSelectCommand,
     sshCommand: sshCommand,
