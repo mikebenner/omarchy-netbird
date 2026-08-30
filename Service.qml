@@ -207,9 +207,13 @@ Item {
 
     if (running) {
       _loginInProgress = false
-      _loginUrlOpened = false
       loginTimeoutTimer.stop()
     }
+    // `_loginUrlOpened` is deliberately NOT cleared here. It is owned by the
+    // login attempt — set when the browser opens, reset only by `up()` and
+    // `cancelLogin()`. Clearing it on a successful poll let a refresh that
+    // landed between the browser opening and `loginProcess` exiting re-arm the
+    // guard, and the exit handler then opened the same SSO URL a second time.
     lastError = ""
   }
 
@@ -482,8 +486,10 @@ Item {
       }
       // A non-zero exit that still printed a whole status document knows more
       // than "Disconnected" does — a NeedsLogin or degraded daemon can exit
-      // non-zero and say so in stdout. Only fall back when there is no
-      // document to read.
+      // non-zero and say so in stdout. `Model.parseStatus` now refuses JSON
+      // that is not a status document, so `{"error":"permission denied"}`
+      // falls through to the error path instead of being read as an
+      // all-defaults "Unknown".
       var salvaged = Model.parseStatus(stdout, Date.now())
       if (salvaged.ok && !salvaged.unavailable) {
         root.parseStatus(stdout)
@@ -491,7 +497,9 @@ Item {
         return
       }
       root.resetUnavailable("Disconnected")
-      root.lastError = root.elideStatus(stderr)
+      // Whatever the CLI did say is the only explanation the user gets, and it
+      // is as likely to be on stdout as on stderr.
+      root.lastError = root.elideStatus(stderr || stdout)
     }
   }
 
@@ -532,8 +540,10 @@ Item {
         delayedRefresh.restart()
         return
       }
+      // Last look at the buffer, and only if nothing was opened yet — the
+      // whole point of the guard is that one login opens at most one browser.
       var combined = String(root._loginBuffer || "")
-      var opened = root.openAuthUrlFrom(combined)
+      var opened = root._loginUrlOpened || root.openAuthUrlFrom(combined)
       if (exitCode !== 0 && !opened) {
         root._desired = -1
         root._loginInProgress = false

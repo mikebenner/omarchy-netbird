@@ -325,9 +325,15 @@ test("loginProgress yields the SSO URL exactly once, on the line that completes 
   ]
   const management = "https://netbird.example:443"
 
+  // Keep reading past the URL line: the URL stays in the buffer forever, so
+  // every later line would re-report it unless loginProgress only answers on
+  // the line that first completed the prompt.
+  const after = ["Waiting for the browser…", "Connected", ""]
+  const fed = lines.concat(after)
+
   let buffer = ""
   const urls = []
-  for (const line of lines) {
+  for (const line of fed) {
     const progress = Model.loginProgress(buffer, line, management)
     buffer = progress.buffer
     urls.push(progress.url)
@@ -336,10 +342,31 @@ test("loginProgress yields the SSO URL exactly once, on the line that completes 
   // Nothing to open until the URL itself arrives.
   assert.deepEqual(urls.slice(0, 3), ["", "", ""])
   assert.equal(urls[3], "https://idp.example/activate")
+  // And nothing after it, however long the process keeps talking.
+  assert.deepEqual(urls.slice(4), ["", "", ""])
   assert.equal(urls.filter((u) => u !== "").length, 1)
   // Each line alone yields nothing — the accumulation is what does the work.
-  for (const line of lines) assert.equal(Model.extractAuthUrl(line, management), "")
-  assert.equal(buffer, lines.join("\n"))
+  for (const line of fed) assert.equal(Model.extractAuthUrl(line, management), "")
+  assert.equal(buffer, fed.join("\n"))
+  // The buffer still holds a URL; it is loginProgress that stops offering it.
+  assert.equal(Model.extractAuthUrl(buffer, management), "https://idp.example/activate")
+})
+
+// NB-03 residual. A second URL later in the same login is not a second
+// invitation either — one login opens at most one browser.
+test("loginProgress never re-reports once a URL has been seen", () => {
+  let buffer = ""
+  const feed = (line) => {
+    const progress = Model.loginProgress(buffer, line, "")
+    buffer = progress.buffer
+    return progress.url
+  }
+
+  assert.equal(feed("Please do the SSO login in your browser."), "")
+  assert.equal(feed("https://idp.example/activate"), "https://idp.example/activate")
+  assert.equal(feed("https://idp.example/second"), "")
+  assert.equal(feed("Use this URL to log in:"), "")
+  assert.equal(feed(""), "")
 })
 
 test("loginProgress handles the short --no-browser prompt and an empty start", () => {
@@ -402,6 +429,94 @@ test("a warning line before the JSON does not lose the document", () => {
   for (const raw of ["netbird: command not found", "{", "<html>{oops}</html>"]) {
     assert.equal(Model.parseStatus(raw, NOW).ok, false, `expected ok=false for ${JSON.stringify(raw)}`)
   }
+})
+
+// NB-04 residual. The daemon reaches its own host on more than one port, and a
+// failure word inside a URL path says nothing about the sentence around it.
+test("extractAuthUrl compares hosts, not URL strings", () => {
+  const management = "https://netbird.example:443"
+  const prompt = "Please do the SSO login in your browser."
+
+  // A port variant of the management host is still the management host.
+  assert.equal(Model.extractAuthUrl(prompt + "\nhttps://netbird.example:8443/device", management), "")
+  // As are case and credential variants.
+  assert.equal(Model.extractAuthUrl(prompt + "\nhttps://NetBird.Example/device", management), "")
+  assert.equal(Model.extractAuthUrl(prompt + "\nhttps://user:pw@netbird.example:8443/device", management), "")
+  // The daemon's own chatter must not win a race against the real IdP line.
+  assert.equal(
+    Model.extractAuthUrl([prompt, "dialing https://netbird.example:8443/device", "https://idp.example/activate"].join("\n"), management),
+    "https://idp.example/activate"
+  )
+
+  assert.equal(Model.hostKey("https://netbird.example:443"), "netbird.example")
+  assert.equal(Model.hostKey("https://NetBird.Example:8443/x?y=1"), "netbird.example")
+  assert.equal(Model.hostKey("https://user:pw@netbird.example./x"), "netbird.example")
+  assert.equal(Model.hostKey("https://[2001:db8::1]:8443/x"), "2001:db8::1")
+  assert.equal(Model.hostKey(""), "")
+})
+
+test("extractAuthUrl judges the sentence, not the link inside it", () => {
+  // A URL path containing "error" is not a failure report.
+  assert.equal(
+    Model.extractAuthUrl("Use this URL to log in: https://idp.example/error-recovery", ""),
+    "https://idp.example/error-recovery"
+  )
+  assert.equal(
+    Model.extractAuthUrl("Use this URL to log in: https://idp.example/oauth?on_failure=retry", ""),
+    "https://idp.example/oauth?on_failure=retry"
+  )
+  // The original false positive is still refused.
+  assert.equal(Model.extractAuthUrl("failed to authenticate TLS peer at https://status.example/error", ""), "")
+  // And a failure word in the prose still wins over a clean URL.
+  assert.equal(Model.extractAuthUrl("Use this URL to log in:\nWARN could not reach https://idp.example/activate", ""), "")
+})
+
+// NB-05 residual. gRPC warnings carry braces of their own, so the old
+// first-brace-to-last-brace span swallowed the warning and the document.
+test("a brace-bearing warning line does not hide the status document", () => {
+  const braced = 'WARNING grpc target {Addr:"/var/run/netbird.sock"}\n{"daemonStatus":"Idle"}'
+  const status = Model.parseStatus(braced, NOW)
+  assert.equal(status.ok, true)
+  assert.equal(status.daemonStatus, "Idle")
+  assert.equal(status.statusText, "Disconnected")
+
+  // Same, with the document pretty-printed across several lines.
+  const multiline = 'WARN grpc {Addr:"x"} retrying\n' + fixture("connected")
+  const full = Model.parseStatus(multiline, NOW)
+  assert.equal(full.ok, true)
+  assert.equal(full.selfIp, "100.64.0.9")
+  assert.equal(full.peers.length, 4)
+
+  // Braces that never form a document are still an error.
+  assert.equal(Model.parseStatus('WARNING grpc {Addr:"x"} and {more:1}', NOW).ok, false)
+})
+
+// NB-06 residual. Not every JSON object on stdout is a status document.
+test("only a status-shaped document is accepted as status", () => {
+  const denied = Model.parseStatus('{"error":"permission denied"}', NOW)
+  assert.equal(denied.ok, false)
+  assert.equal(denied.unavailable, true)
+  assert.equal(denied.daemonStatus, "Unknown")
+  // A distinct error, so the caller can tell this from "stdout was not JSON".
+  assert.equal(denied.error, "netbird status output is not a status document")
+  assert.equal(Model.parseStatus("netbird: command not found", NOW).error, "Failed to parse netbird status")
+
+  // A real document exits non-zero and is still a document.
+  const needsLogin = Model.parseStatus('{"daemonStatus":"NeedsLogin","peers":{"details":[]}}', NOW)
+  assert.equal(needsLogin.ok, true)
+  assert.equal(needsLogin.needsLogin, true)
+  assert.equal(needsLogin.statusText, "Needs login")
+
+  assert.equal(Model.isStatusDocument({ daemonStatus: "Idle" }), true)
+  assert.equal(Model.isStatusDocument({ peers: { total: 0 } }), true)
+  assert.equal(Model.isStatusDocument({ management: { connected: true } }), true)
+  // Go marshals an absent sub-struct as null; the key is the identity.
+  assert.equal(Model.isStatusDocument({ peers: null }), true)
+  assert.equal(Model.isStatusDocument({ error: "permission denied" }), false)
+  assert.equal(Model.isStatusDocument({ daemonStatus: 7 }), false)
+  assert.equal(Model.isStatusDocument({ peers: "none" }), false)
+  assert.equal(Model.isStatusDocument([{ daemonStatus: "Idle" }]), false)
+  assert.equal(Model.isStatusDocument(null), false)
 })
 
 test("extractAuthUrl only opens a browser for an actual login prompt", () => {
