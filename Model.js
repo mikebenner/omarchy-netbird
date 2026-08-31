@@ -1080,8 +1080,9 @@ function readSatisfiesRequest(capturedEpoch, currentEpoch) {
 //     NAME     ACTIVE
 //     default  ✓
 //
-// Both shapes are parsed. Derived from the upstream printer, netbird v0.77.1
-// `client/cmd/profile.go`:
+// Both shapes are parsed. Derived from the upstream printer,
+// `client/cmd/profile.go` — identical at v0.77.0 and v0.77.1, both checked,
+// so everything below holds for either:
 //
 //     tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)      // :114
 //     fmt.Fprintln(tw, "ID\tNAME\tACTIVE")  / "NAME\tACTIVE"             // :116,:118
@@ -1128,6 +1129,13 @@ var PROFILE_HEADER = /^NAME(\s{2,})ACTIVE\s*$/
 var PROFILE_ACTIVE_MARKER = "✓"
 // The charset `IsValidProfileFilenameStem` accepts, plus its 64-rune cap.
 var PROFILE_ID_SHAPE = /^[\p{L}\p{N}_-]{1,64}$/u
+// `id.ShortID()` prints the literal `default` or the id's first eight runes
+// (`client/internal/profilemanager/id.go:19-21,:105-114`), so the ID column
+// never holds anything longer.
+var PROFILE_SHORT_ID_MAX = 8
+// tabwriter's padding, the second-to-last argument the printer passes it:
+// every aligned column is its widest cell plus exactly this.
+var PROFILE_PADDING = 2
 // Only the id-less table needs these: with no identity column, a line of
 // prose that happens to align is the same shape as a row, so what it says is
 // the only thing left to judge it by. A profile genuinely named "info" is
@@ -1164,10 +1172,42 @@ function normalizeProfileName(name) {
   return String(name === undefined || name === null ? "" : name).replace(/\s+$/, "")
 }
 
-// Returns `{ ok, hasIds, profiles }`. `ok` is false only when the output was
-// not a table at all — no header. A header with no rows under it is `ok` with
-// an empty list, which the caller applies: treating an empty parse as a read
-// failure turned any format drift into total feature loss plus a retry storm.
+// Returns `{ ok, hasIds, profiles }`, and the table is judged as a whole.
+//
+// `ok` false means "this output is not a profile table we can trust" — either
+// there is no header, or something under the header is not a row this printer
+// could have produced. It is deliberately NOT the same as an empty table:
+//
+//   no header at all          → malformed (ok:false), no rows
+//   header + zero rows        → a valid empty list (ok:true, no rows)
+//   header + a line that is
+//   not a conforming row      → malformed (ok:false), no rows
+//
+// The last case is the one that changed. Skipping the offending line and
+// keeping the rest was permissive in the wrong direction: a warning printed
+// under a real table added a phantom row to a real list, and a single line of
+// aligned prose became a whole list of one. A table is a unit — if any part
+// of it is not something the printer emits, none of it is trustworthy, and
+// the caller keeps the list it already had rather than showing a partial one
+// with a phantom in it.
+//
+// Two structural rules do the work, both read off the printer rather than
+// guessed at from what a line says:
+//
+//   * per line — the geometry rules above (padding, boundaries, id shape);
+//   * per column — tabwriter sets a column's width to its widest cell plus
+//     the padding, so in any table it really emitted there is at least one
+//     cell in each aligned column that fills the column exactly. The
+//     reproducer that got past the line rules,
+//
+//         ID        NAME         ACTIVE
+//         failed    oops
+//
+//     fails this: the ID column is ten wide, so its widest cell must be
+//     eight, and the widest here is `default`… there is no `default` — the
+//     widest is `failed`, six. tabwriter would have printed that column
+//     eight wide. Nothing the printer emits is loose in a column, so a table
+//     that is loose was not printed by it.
 function parseProfileTable(raw) {
   var lines = String(raw === undefined || raw === null ? "" : raw).split(/\r?\n/)
 
@@ -1193,54 +1233,75 @@ function parseProfileTable(raw) {
       break
     }
   }
+  // Lines *above* the header are not part of the table — the CLI's own gRPC
+  // chatter lands there — so they are not judged. The header is what anchors
+  // everything below it.
   if (headerAt === -1) return { ok: false, hasIds: false, profiles: [] }
+
+  var malformed = { ok: false, hasIds: hasIds, profiles: [] }
+
+  // The widest cell seen in each aligned column, header included. The ACTIVE
+  // column is a *trailing* cell, which tabwriter neither pads nor aligns, so
+  // it has no width to check.
+  var widestId = hasIds ? "ID".length : 0
+  var widestName = "NAME".length
 
   var profiles = []
   for (var j = headerAt + 1; j < lines.length; j++) {
     var line = lines[j]
+    // A blank line ends nothing and means nothing: the trailing newline makes
+    // one, and CRLF input another.
     if (line.trim() === "") continue
-    // Rule 4: rune offsets, because that is what tabwriter padded to.
+    // Rune offsets, because that is what tabwriter padded to.
     var chars = toRunes(line)
-    if (chars.length < activeAt) continue
+    if (chars.length < activeAt) return malformed
 
-    // Rule 3: the marker is the trailing cell — it begins exactly on the
-    // boundary and is never padded, so nothing sits past the column but the
-    // marker itself.
+    // The marker is the trailing cell — it begins exactly on the boundary and
+    // is never padded, so nothing sits past the column but the marker itself.
     var marker = chars.slice(activeAt).join("")
-    if (marker !== "" && /^\s/.test(marker)) continue
+    if (marker !== "" && /^\s/.test(marker)) return malformed
 
-    // Rule 1: the name cell is padded to its column, so it ends in at least
-    // two spaces. Its *content* is not judged: with an id column the name is
-    // display text, free to start with a space or carry an emoji.
+    // The name cell is padded to its column, so it ends in at least two
+    // spaces. Its *content* is not judged when an id column exists: the name
+    // is display text, free to start with a space or carry an emoji.
     var nameCell = chars.slice(nameAt, activeAt).join("")
-    if (!/ {2}$/.test(nameCell)) continue
+    if (!/ {2}$/.test(nameCell)) return malformed
     var name = trimCellPadding(nameCell)
-    if (name === "") continue
+    if (name === "") return malformed
+    if (toRunes(name).length > widestName) widestName = toRunes(name).length
 
     var id
     if (hasIds) {
       var idCell = chars.slice(0, nameAt).join("")
-      if (!/ {2}$/.test(idCell)) continue
+      if (!/ {2}$/.test(idCell)) return malformed
       id = trimCellPadding(idCell)
-      // The positive test that replaces guessing at prose: a real id is a
-      // filename stem, never whitespace and never punctuation.
-      if (!PROFILE_ID_SHAPE.test(id)) continue
+      // A printed id is `id.ShortID()`: the literal `default`, or an id
+      // truncated to its first `shortIDLen` = 8 runes (`id.go:18-21,105-114`,
+      // same in 0.77.0 and 0.77.1), so it is never longer than that — and it is a filename stem, so never whitespace and
+      // never punctuation (`IsValidProfileFilenameStem`, `id.go:46-69`).
+      if (toRunes(id).length > PROFILE_SHORT_ID_MAX || !PROFILE_ID_SHAPE.test(id)) return malformed
+      if (toRunes(id).length > widestId) widestId = toRunes(id).length
     } else {
-      if (PROFILE_NON_ROW.test(line) || PROFILE_TIMESTAMPED.test(line)) continue
+      if (PROFILE_NON_ROW.test(line) || PROFILE_TIMESTAMPED.test(line)) return malformed
       // No identity column: the name is the handle, so its shape is back to
       // being syntax. tabwriter writes the first cell at column zero, so a
       // row never begins with whitespace.
-      if (/^\s/.test(name)) continue
+      if (/^\s/.test(name)) return malformed
       id = normalizeProfileName(name)
     }
 
-    // Rule 3 again, held loosely: "✓" is what v0.77.1 writes, but the cell is
-    // only ever *empty* for an inactive profile, so any non-empty marker
-    // means active. Reading an unknown marker as inactive would be worse:
-    // with no row active, the panel offers a select of the profile already in
-    // use, and a select recycles the engine.
+    // "✓" is what v0.77.1 writes, but the cell is only ever *empty* for an
+    // inactive profile, so any non-empty marker means active. Reading an
+    // unknown marker as inactive would be worse: with no row active, the
+    // panel offers a select of the profile already in use, and a select
+    // recycles the engine.
     profiles.push({ id: id, name: name, active: marker !== "" })
   }
+
+  // The column-width check. Every aligned column is its widest cell plus the
+  // padding; a column wider than that was not laid out by this printer.
+  if (hasIds && widestId + PROFILE_PADDING !== nameAt) return malformed
+  if (widestName + PROFILE_PADDING !== activeAt - nameAt) return malformed
 
   // Two rows that cannot be told apart are not selectable — sending either
   // handle would be a coin flip between accounts. Real ids are unique, so

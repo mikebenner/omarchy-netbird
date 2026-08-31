@@ -1070,11 +1070,15 @@ const GO_TABLE_WITH_IDS = [
   ""
 ].join("\n")
 
+// The same six profiles minus the leading-space one, which upstream cannot
+// store anyway (`sanitizeDisplayName` TrimSpaces) and which the id-less shape
+// cannot represent: with no ID column the name's shape is the only thing
+// saying where a row begins, so a name starting with a space makes the whole
+// table untrustworthy rather than one row disappear from it.
 const GO_TABLE_NO_IDS = [
   "NAME          ACTIVE",
   "default       ",
   "😀 party       ✓",
-  " leading      ",
   "Work          ",
   "Work          ",
   "büro  spaced  ",
@@ -1188,6 +1192,12 @@ test("legal names survive: a leading space, an emoji, and doubled spaces", () =>
   // The emoji row also survives the id-less table: rune measurement is what
   // fixes it, and that is common to both shapes.
   assert.equal(Model.parseProfileTable(GO_TABLE_NO_IDS).profiles.some((p) => p.name === "😀 party"), true)
+
+  // A leading space needs the ID column. Without one the name's shape is the
+  // only thing saying where a row starts, so such a line is not a row this
+  // printer could have produced and the table is refused whole — no row is
+  // silently dropped from a list that is then shown as if complete.
+  assert.equal(Model.parseProfileTable("NAME      ACTIVE\n leading  \n").ok, false)
 })
 
 test("upstream trims a name, so the padding right-trim recovers it exactly", () => {
@@ -1213,11 +1223,12 @@ test("parseProfileTable refuses anything that is not a table", () => {
     Model.parseProfileList("WARNING failed to open log file\nNAME     ACTIVE\ndefault  ✓\n").map((p) => p.name),
     ["default"]
   )
-  // A warning *after* the table does not become a row.
-  assert.deepEqual(Model.parseProfileList(PROFILE_TABLE + "WARNING failed to read cache\n").map((p) => p.name),
-    ["default", "Work Account", "büro"])
+  // A warning *after* the table voids the table rather than being skipped:
+  // keeping the rows around it is how a phantom got added to a real list.
+  assert.equal(Model.parseProfileTable(PROFILE_TABLE + "WARNING failed to read cache\n").ok, false)
+  assert.deepEqual(Model.parseProfileList(PROFILE_TABLE + "WARNING failed to read cache\n"), [])
   // A line too short to reach the ACTIVE column is not a row.
-  assert.deepEqual(Model.parseProfileList("NAME          ACTIVE\nshort\n"), [])
+  assert.equal(Model.parseProfileTable("NAME          ACTIVE\nshort\n").ok, false)
 })
 
 test("printer-impossible tables yield no phantom or mis-split rows", () => {
@@ -1290,6 +1301,88 @@ test("a CLI that rejects --show-id is recognised, not retried forever", () => {
   // A failure that merely dumps the usage text mentions the flag too; that
   // must not cost the session its id column.
   assert.equal(Model.rejectsShowId(1, "Error: daemon unavailable\nFlags:\n  --show-id   show the profile ID column", ""), false)
+})
+
+// --- the table is judged as a whole ------------------------------------------
+
+// The gate's reproducer, padded to real tabwriter geometry. `failed` satisfies
+// the id character set and `oops` sits in the NAME column, so the line rules
+// alone accepted it — and a whole list of one phantom is what the panel then
+// offered to click.
+const PROSE_ONLY = "ID        NAME         ACTIVE\nfailed    oops         \n"
+// The same prose under a real row: the phantom joined a genuine list.
+const PROSE_AFTER_ROW = "ID        NAME         ACTIVE\ndefault   default      ✓\nfailed    oops         \n"
+
+test("aligned prose under a header is not a table", () => {
+  const table = Model.parseProfileTable(PROSE_ONLY)
+  assert.equal(table.ok, false, "the reproducer must be malformed, not a one-row list")
+  assert.deepEqual(table.profiles, [])
+  assert.deepEqual(Model.parseProfileList(PROSE_ONLY), [])
+
+  // Why it is rejected, and it is structural: tabwriter makes every aligned
+  // column its widest cell plus two, so a ten-wide ID column must hold an
+  // eight-rune id somewhere. The widest here is `failed`, six.
+  assert.equal(Model.parseProfileTable("ID        NAME    ACTIVE\nfailed    oops    \n").ok, false)
+  // And nothing that reaches this row is selectable, since there is no row.
+  assert.equal(Model.resolveProfileSelection(table.profiles, "failed").reason, "unknown")
+})
+
+test("a real row followed by aligned prose voids the whole table", () => {
+  const table = Model.parseProfileTable(PROSE_AFTER_ROW)
+  assert.equal(table.ok, false)
+  assert.equal(table.profiles.length, 0, "specifically not a one-row list with the phantom dropped")
+  // Skipping the offending line and keeping the good one is what let a
+  // warning printed under a table add a phantom to a real list. The caller
+  // treats a malformed read as a failed read and keeps the list it had.
+  assert.deepEqual(Model.parseProfileList(PROSE_AFTER_ROW), [])
+})
+
+test("a header with no rows under it is still a valid empty list", () => {
+  // Unchanged, and the distinction the service depends on: an empty *table*
+  // is an answer to apply, not a failed read to retry.
+  for (const raw of ["ID  NAME  ACTIVE\n", "NAME  ACTIVE\n", "ID  NAME  ACTIVE\n\n\n"]) {
+    const table = Model.parseProfileTable(raw)
+    assert.equal(table.ok, true, raw)
+    assert.deepEqual(table.profiles, [])
+  }
+})
+
+test("output with no header at all is malformed", () => {
+  // Unchanged: no header, no table, whatever the lines look like.
+  for (const raw of ["", "   ", null, undefined, "no profiles", "default  ✓\n", "failed    oops         \n"]) {
+    const table = Model.parseProfileTable(raw)
+    assert.equal(table.ok, false)
+    assert.deepEqual(table.profiles, [])
+  }
+})
+
+test("a correct table of either shape still parses in full", () => {
+  // The regression guard: whole-table strictness must not cost a real table
+  // a single row. Both fixtures are byte-exact Go tabwriter output.
+  const withIds = Model.parseProfileTable(GO_TABLE_WITH_IDS)
+  assert.equal(withIds.ok, true)
+  assert.deepEqual(withIds.profiles.map((p) => p.id),
+    ["default", "a1b2c3d4", "9f8e7d6c", "11112222", "33334444", "55556666"])
+
+  const noIds = Model.parseProfileTable(GO_TABLE_NO_IDS)
+  assert.equal(noIds.ok, true)
+  assert.deepEqual(noIds.profiles.map((p) => p.name), ["default", "😀 party", "Work", "Work", "büro  spaced"])
+
+  // And the live one-profile tables this machine prints, in both shapes.
+  assert.equal(Model.parseProfileTable(LIVE_TABLE_WITH_IDS).profiles.length, 1)
+  assert.equal(Model.parseProfileTable(LIVE_TABLE).profiles.length, 1)
+})
+
+test("trailing blank lines and CRLF do not spoil a good table", () => {
+  const expected = Model.parseProfileTable(GO_TABLE_WITH_IDS)
+  assert.equal(expected.ok, true)
+
+  for (const variant of [GO_TABLE_WITH_IDS + "\n\n", GO_TABLE_WITH_IDS + "   \n",
+                         GO_TABLE_WITH_IDS.replace(/\n/g, "\r\n"), "\n" + GO_TABLE_WITH_IDS]) {
+    const table = Model.parseProfileTable(variant)
+    assert.equal(table.ok, true, JSON.stringify(variant.slice(-6)))
+    assert.deepEqual(table.profiles, expected.profiles)
+  }
 })
 
 // --- peer actions -----------------------------------------------------------
@@ -1701,8 +1794,8 @@ test("an unrecognised ACTIVE marker keeps the row instead of deleting it", () =>
   // the profile already in use, which recycles the engine.
   assert.deepEqual(Model.parseProfileList("NAME     ACTIVE\ndefault  \nwork     *\n").map((p) => [p.name, p.active]),
     [["default", false], ["work", true]])
-  assert.deepEqual(Model.parseProfileList("NAME     ACTIVE\nwork     yes\n").map((p) => p.active), [true])
-  assert.deepEqual(Model.parseProfileList("NAME     ACTIVE\nwork     ✔\n").map((p) => p.active), [true])
+  assert.deepEqual(Model.parseProfileList("NAME  ACTIVE\nwork  yes\n").map((p) => p.active), [true])
+  assert.deepEqual(Model.parseProfileList("NAME  ACTIVE\nwork  ✔\n").map((p) => p.active), [true])
   // Same in the --show-id table, where the id still fixes the identity.
   assert.deepEqual(Model.parseProfileList("ID        NAME  ACTIVE\nab12cd34  work  *\n").map((p) => [p.id, p.active]),
     [["ab12cd34", true]])

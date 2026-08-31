@@ -322,14 +322,19 @@ Deliberate edges, each chosen over guessing:
 - `netbird profile list` has no `--json` either, so its table is parsed as
   text against what Go's `text/tabwriter` emits — measured in code points,
   the way tabwriter measured when it laid the table out, so names carrying
-  emoji or other astral-plane characters are read correctly. With
-  `--show-id` a row is accepted only when its ID cell holds something that
-  can be an ID (letters, digits, `_`, `-`, never a space), which is what
-  keeps a stray line of output from becoming a clickable profile. Without
-  that column — an older CLI — the widget has only the shape of the line to
-  go on: it rejects lines that announce themselves as warnings or errors and
-  lines whose name begins with a space, so a profile named with a leading
-  space would not be listed there.
+  emoji or other astral-plane characters are read correctly. The table is
+  accepted or rejected **whole**: every line under the header must be a row
+  that printer could have produced, in its cell padding, in its ID (letters,
+  digits, `_`, `-`, never a space, never longer than the eight characters
+  `--show-id` prints) and in its column widths, which tabwriter always sets
+  to the widest cell plus two. One line that does not fit voids the list
+  rather than being skipped — a warning printed under a real table would
+  otherwise add a clickable row that is not a profile. A voided read changes
+  nothing on screen: the previous list stays until a good one arrives.
+  Without an ID column — an older CLI — the name's own shape is the only
+  thing marking where a row starts, so there a profile named with a leading
+  space voids the table instead of appearing. NetBird trims profile names
+  when it stores them, so that name cannot occur in practice.
 - The management-host check that stops the SSO flow opening the daemon's own
   endpoint compares ASCII hostnames. There is no IDNA canonicalisation, so an
   internationalised management URL and its punycode spelling
