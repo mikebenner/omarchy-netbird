@@ -479,16 +479,23 @@ Item {
   }
 
   // Both are argv vectors, never a shell string: the address comes from the
-  // daemon and must never be handed to something that parses it.
+  // daemon and must never be handed to something that parses it. The builders
+  // return null for an address that is not an IP or a DNS name, and a peer the
+  // management server described that way simply has no action — nothing is
+  // launched, and nothing is passed on for a callee to interpret.
   function sshToPeer(peer) {
-    if (!peer || String(peer.ip || "") === "") return false
-    Quickshell.execDetached(Model.sshCommand(peer.ip))
+    if (!peer) return false
+    var argv = Model.sshCommand(peer.ip)
+    if (!argv) return false
+    Quickshell.execDetached(argv)
     return true
   }
 
   function pingPeer(peer) {
-    if (!peer || String(peer.ip || "") === "") return false
-    Quickshell.execDetached(Model.pingCommand(peer.ip))
+    if (!peer) return false
+    var argv = Model.pingCommand(peer.ip)
+    if (!argv) return false
+    Quickshell.execDetached(argv)
     return true
   }
 

@@ -740,14 +740,21 @@ function networksListCommand() {
 // use -a to append to already selected networks" — so selecting a second
 // network without it silently deselects the first, which is precisely the bug
 // a competing plugin shipped.
+// The id is read out of `netbird networks list`, so like a peer address it comes
+// from the management server rather than from the user. netbird's flag parser
+// reads an operand beginning with `-` as a flag wherever it sits — verified on
+// 0.77.0, where `netbird networks deselect --help` prints help instead of
+// looking for a route by that name — so an id of `--daemon-addr=tcp://host:port`
+// would redirect the command at another daemon. `--` ends the parsing: after it,
+// the same string comes back as `route '--help' is not available`.
 function networksSelectCommand(id) {
   return timeoutPrefix(DAEMON_TIMEOUT_SEC, DAEMON_KILL_GRACE_SEC)
-    .concat(["netbird", "networks", "select", "-a", String(id)])
+    .concat(["netbird", "networks", "select", "-a", "--", String(id)])
 }
 
 function networksDeselectCommand(id) {
   return timeoutPrefix(DAEMON_TIMEOUT_SEC, DAEMON_KILL_GRACE_SEC)
-    .concat(["netbird", "networks", "deselect", String(id)])
+    .concat(["netbird", "networks", "deselect", "--", String(id)])
 }
 
 // "all" is special-cased upstream ahead of the append flag, so passing -a here
@@ -1361,16 +1368,138 @@ function profileSelectCommand(handle) {
   // The same normalisation `resolveProfileSelection` approved, so what was
   // checked is exactly what is sent. With `--show-id` this is the profile's
   // id, which `profile select` accepts alongside a name or a unique prefix.
+  // A profile is local, so this handle is not management-controlled the way a
+  // network id is; `--` is here so that every builder taking a variable operand
+  // ends option parsing the same way, rather than each one being reasoned about
+  // separately whenever the threat model shifts.
   return timeoutPrefix(DAEMON_TIMEOUT_SEC, DAEMON_KILL_GRACE_SEC)
-    .concat(["netbird", "profile", "select", normalizeProfileHandle(handle)])
+    .concat(["netbird", "profile", "select", "--", normalizeProfileHandle(handle)])
+}
+
+// --- peer actions -----------------------------------------------------------
+//
+// A peer's address is whatever the management server put in the daemon's status
+// output. It is not the local user's input, so it is exactly the kind of value a
+// command line may not be built from naively — and an argv vector on its own is
+// not enough to make it safe. `ssh -oProxyCommand=… host` runs the ProxyCommand,
+// and passing `-oProxyCommand=…` as a single argv element changes nothing: `ssh`
+// still parses it as an option. Two independent defences, and both stay, because
+// either alone is a single point of failure:
+//
+//   * `--` ends option parsing, so the callee reads the address as an operand
+//     whatever it begins with. Structural, and holds even if the shape check
+//     below turns out to be wrong about some address.
+//   * the shape check refuses to build a command at all for anything that is not
+//     an IP or a DNS name — which is what covers a value that is not an option
+//     but is still not an address.
+
+// Bounded to what `inet_aton` would read as an octet, and leading zeros are
+// refused: `010` is octal there, so `100.64.0.010` and `100.64.0.8` would be the
+// same host while reading as different ones.
+var IPV4_OCTET = /^(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$/
+
+function isIpv4Address(text) {
+  var parts = String(text).split(".")
+  if (parts.length !== 4) return false
+  for (var i = 0; i < parts.length; i++) {
+    if (!IPV4_OCTET.test(parts[i])) return false
+  }
+  return true
+}
+
+var IPV6_GROUP = /^[0-9A-Fa-f]{1,4}$/
+
+// Structural rather than one long pattern, because the rules are structural: at
+// most one `::`, at most eight 16-bit groups, and a trailing dotted quad standing
+// in for the last two. A zone id (`%eth0`) is deliberately not accepted — it
+// cannot occur in a NetBird overlay address and it would widen the charset.
+function isIpv6Address(text) {
+  var value = String(text)
+  if (value.indexOf(":") === -1) return false
+
+  var halves = value.split("::")
+  if (halves.length > 2) return false
+  var compressed = halves.length === 2
+
+  var head = halves[0] === "" ? [] : halves[0].split(":")
+  var tail = !compressed || halves[1] === "" ? [] : halves[1].split(":")
+
+  // A dotted quad stands in for the last two groups, so it is one only where it
+  // is genuinely last: the final group of the tail when the address has a tail,
+  // of the head when nothing is compressed. An address ending in `::` has no
+  // final group at all, which is what makes `192.0.2.1::` not an address.
+  var trailing = compressed ? tail : head
+  var embedded = 0
+  if (trailing.length > 0 && trailing[trailing.length - 1].indexOf(".") !== -1) {
+    if (!isIpv4Address(trailing[trailing.length - 1])) return false
+    trailing.pop()
+    embedded = 2
+  }
+
+  var groups = head.concat(tail)
+  for (var i = 0; i < groups.length; i++) {
+    if (!IPV6_GROUP.test(groups[i])) return false
+  }
+
+  // `::` stands for at least one group, so a compressed address is short by
+  // definition; an uncompressed one has to be complete.
+  var width = groups.length + embedded
+  return compressed ? width < 8 : width === 8
+}
+
+// The letter-digit-hyphen form, which is what NetBird's own `fqdn` field carries.
+// Bounded the way DNS bounds it, and a label may neither open nor close with a
+// hyphen — which is also what keeps the whole string from ever beginning with the
+// `-` that made this a vulnerability in the first place.
+var DNS_LABEL = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/
+var DNS_ALL_DIGITS = /^[0-9]+$/
+var DNS_NAME_MAX = 253
+
+function isDnsName(text) {
+  var value = String(text)
+  // One trailing dot is the root label and is a legal way to write a name.
+  if (value.charAt(value.length - 1) === ".") value = value.slice(0, -1)
+  if (value === "" || value.length > DNS_NAME_MAX) return false
+
+  var labels = value.split(".")
+  // An FQDN, not a bare hostname: a name with no dot in it is not one, and
+  // refusing the single-label form keeps the accepted set as small as the
+  // feature actually needs.
+  if (labels.length < 2) return false
+  for (var i = 0; i < labels.length; i++) {
+    if (!DNS_LABEL.test(labels[i])) return false
+  }
+  // A final label of digits only would be a malformed IPv4 rather than a name.
+  return !DNS_ALL_DIGITS.test(labels[labels.length - 1])
+}
+
+function isPeerAddress(address) {
+  var text = String(address === undefined || address === null ? "" : address)
+  if (text === "") return false
+  return isIpv4Address(text) || isIpv6Address(text) || isDnsName(text)
+}
+
+// Returns null rather than a command when the address is not one, so the caller
+// launches nothing at all. Rejecting is the point: passing the value on and
+// trusting the callee to cope with it is what was wrong before.
+// Stringified once, and it is that snapshot which is both checked and sent, so
+// the check and the argv cannot disagree about what was approved — the same
+// reason `profileSelectCommand` sends the handle `resolveProfileSelection`
+// normalised. Converting twice would let an object whose `toString` answers
+// differently on the second call pass the check and put something else on the
+// command line.
+function peerActionCommand(tool, address) {
+  var text = String(address === undefined || address === null ? "" : address)
+  if (!isPeerAddress(text)) return null
+  return ["omarchy-launch-terminal", tool, "--", text]
 }
 
 function sshCommand(address) {
-  return ["omarchy-launch-terminal", "ssh", String(address)]
+  return peerActionCommand("ssh", address)
 }
 
 function pingCommand(address) {
-  return ["omarchy-launch-terminal", "ping", String(address)]
+  return peerActionCommand("ping", address)
 }
 
 // --- admin console ----------------------------------------------------------
@@ -1381,6 +1510,7 @@ function pingCommand(address) {
 // from app.netbird.io, so the host cannot simply be reused there.
 var HOSTED_MANAGEMENT_HOST = "api.netbird.io"
 var HOSTED_CONSOLE_URL = "https://app.netbird.io"
+var CONSOLE_SCHEME = /^https?$/
 
 function adminConsoleUrl(managementUrl, override) {
   var explicit = String(override || "").trim()
@@ -1394,6 +1524,12 @@ function adminConsoleUrl(managementUrl, override) {
 
   var schemeMatch = url.match(/^([a-z][a-z0-9+.-]*):\/\//i)
   var scheme = schemeMatch ? schemeMatch[1].toLowerCase() : "https"
+  // The result is handed to a browser, and this branch — unlike the override
+  // above, which is the local user's own setting — derives from the management
+  // URL the daemon reports. A management server answering `file://localhost`
+  // would otherwise have the plugin open a local file. An admin console is
+  // always http(s), so any other scheme yields no link at all.
+  if (!CONSOLE_SCHEME.test(scheme)) return ""
   var rest = schemeMatch ? url.substring(schemeMatch[0].length) : url
   var authority = rest.split("/")[0].split("?")[0]
   if (authority === "") return ""
@@ -1570,6 +1706,7 @@ if (typeof module !== "undefined") {
     rejectsShowId: rejectsShowId,
     profileListCommand: profileListCommand,
     profileSelectCommand: profileSelectCommand,
+    isPeerAddress: isPeerAddress,
     sshCommand: sshCommand,
     pingCommand: pingCommand,
     adminConsoleUrl: adminConsoleUrl,

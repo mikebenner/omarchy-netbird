@@ -307,6 +307,34 @@ stops the daemon itself.
 
 Deliberate edges, each chosen over guessing:
 
+- **SSH and ping are offered only for a peer whose address parses as an IP or a
+  DNS name.** A peer's address is whatever the management server put in the
+  daemon's status output, so it is not the local user's input, and `ssh` reads an
+  argument beginning with `-` as an option however it is passed — an address of
+  `-oProxyCommand=…` would run that command. Both defences are kept, because
+  either alone is a single point of failure: every launch puts `--` immediately
+  before the address, and an address that is not an IPv4, IPv6 or LDH domain name
+  builds no command at all. A peer described that way shows no SSH or ping
+  button, and `s` / `p` do nothing on it. Deliberately strict in the safe
+  direction: leading-zero octets, a zone id (`fd00::1%eth0`), a bare
+  single-label hostname, and anything carrying `@`, `/` or a port are all
+  refused rather than passed on.
+
+- **Every command built from a value the daemon reported ends its option
+  parsing with `--`.** The peer address is not the only such value: a network id
+  comes from `netbird networks list`, whose rows the management server supplies,
+  and netbird's own flag parser reads an operand beginning with `-` as a flag
+  wherever it sits — on 0.77.0 `netbird networks deselect --help` prints help
+  rather than looking for a route by that name, so an id of
+  `--daemon-addr=tcp://host:port` would have pointed the command at another
+  daemon. `--` is therefore in the networks select and deselect commands and in
+  profile select too, even though a profile is local rather than
+  management-supplied — one rule for every builder beats reasoning about each
+  one separately whenever the threat model shifts. For the same reason the admin
+  console link is only ever built for an `http`/`https` management URL: it is
+  handed to a browser, and a management server answering `file://localhost`
+  would otherwise have the plugin open a local file.
+
 - Retained process output is capped per stream: whole lines are dropped from
   the front, and every failure message that reaches you — a status error, a
   failed `up`/`down`, a networks command, a profile switch — ends with
