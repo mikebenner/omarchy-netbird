@@ -740,14 +740,21 @@ function networksListCommand() {
 // use -a to append to already selected networks" — so selecting a second
 // network without it silently deselects the first, which is precisely the bug
 // a competing plugin shipped.
+// The id is read out of `netbird networks list`, so like a peer address it comes
+// from the management server rather than from the user. netbird's flag parser
+// reads an operand beginning with `-` as a flag wherever it sits — verified on
+// 0.77.0, where `netbird networks deselect --help` prints help instead of
+// looking for a route by that name — so an id of `--daemon-addr=tcp://host:port`
+// would redirect the command at another daemon. `--` ends the parsing: after it,
+// the same string comes back as `route '--help' is not available`.
 function networksSelectCommand(id) {
   return timeoutPrefix(DAEMON_TIMEOUT_SEC, DAEMON_KILL_GRACE_SEC)
-    .concat(["netbird", "networks", "select", "-a", String(id)])
+    .concat(["netbird", "networks", "select", "-a", "--", String(id)])
 }
 
 function networksDeselectCommand(id) {
   return timeoutPrefix(DAEMON_TIMEOUT_SEC, DAEMON_KILL_GRACE_SEC)
-    .concat(["netbird", "networks", "deselect", String(id)])
+    .concat(["netbird", "networks", "deselect", "--", String(id)])
 }
 
 // "all" is special-cased upstream ahead of the append flag, so passing -a here
@@ -1361,8 +1368,12 @@ function profileSelectCommand(handle) {
   // The same normalisation `resolveProfileSelection` approved, so what was
   // checked is exactly what is sent. With `--show-id` this is the profile's
   // id, which `profile select` accepts alongside a name or a unique prefix.
+  // A profile is local, so this handle is not management-controlled the way a
+  // network id is; `--` is here so that every builder taking a variable operand
+  // ends option parsing the same way, rather than each one being reasoned about
+  // separately whenever the threat model shifts.
   return timeoutPrefix(DAEMON_TIMEOUT_SEC, DAEMON_KILL_GRACE_SEC)
-    .concat(["netbird", "profile", "select", normalizeProfileHandle(handle)])
+    .concat(["netbird", "profile", "select", "--", normalizeProfileHandle(handle)])
 }
 
 // --- peer actions -----------------------------------------------------------
@@ -1486,6 +1497,7 @@ function pingCommand(address) {
 // from app.netbird.io, so the host cannot simply be reused there.
 var HOSTED_MANAGEMENT_HOST = "api.netbird.io"
 var HOSTED_CONSOLE_URL = "https://app.netbird.io"
+var CONSOLE_SCHEME = /^https?$/
 
 function adminConsoleUrl(managementUrl, override) {
   var explicit = String(override || "").trim()
@@ -1499,6 +1511,12 @@ function adminConsoleUrl(managementUrl, override) {
 
   var schemeMatch = url.match(/^([a-z][a-z0-9+.-]*):\/\//i)
   var scheme = schemeMatch ? schemeMatch[1].toLowerCase() : "https"
+  // The result is handed to a browser, and this branch — unlike the override
+  // above, which is the local user's own setting — derives from the management
+  // URL the daemon reports. A management server answering `file://localhost`
+  // would otherwise have the plugin open a local file. An admin console is
+  // always http(s), so any other scheme yields no link at all.
+  if (!CONSOLE_SCHEME.test(scheme)) return ""
   var rest = schemeMatch ? url.substring(schemeMatch[0].length) : url
   var authority = rest.split("/")[0].split("?")[0]
   if (authority === "") return ""

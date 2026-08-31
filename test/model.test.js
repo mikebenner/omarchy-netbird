@@ -947,8 +947,8 @@ test("parseNetworksList yields nothing rather than phantom rows", () => {
 // single-row toggle without it silently deselects everything else.
 test("network commands carry the append flag exactly where they must", () => {
   assert.deepEqual(Model.networksListCommand(), ["timeout", "-k", "2", "8", "netbird", "networks", "list"])
-  assert.deepEqual(Model.networksSelectCommand("x"), ["timeout", "-k", "2", "8", "netbird", "networks", "select", "-a", "x"])
-  assert.deepEqual(Model.networksDeselectCommand("x"), ["timeout", "-k", "2", "8", "netbird", "networks", "deselect", "x"])
+  assert.deepEqual(Model.networksSelectCommand("x"), ["timeout", "-k", "2", "8", "netbird", "networks", "select", "-a", "--", "x"])
+  assert.deepEqual(Model.networksDeselectCommand("x"), ["timeout", "-k", "2", "8", "netbird", "networks", "deselect", "--", "x"])
   // "all" is special-cased upstream ahead of the flag, so -a would be noise.
   assert.deepEqual(Model.networksSelectAllCommand(), ["timeout", "-k", "2", "8", "netbird", "networks", "select", "all"])
   assert.deepEqual(Model.networksDeselectAllCommand(), ["timeout", "-k", "2", "8", "netbird", "networks", "deselect", "all"])
@@ -956,7 +956,22 @@ test("network commands carry the append flag exactly where they must", () => {
   assert.equal(Model.networksSelectAllCommand().indexOf("-a"), -1)
   assert.equal(Model.networksDeselectCommand("x").indexOf("-a"), -1)
   // Ids are stringified, never interpolated into a shell string.
-  assert.deepEqual(Model.networksSelectCommand(42).slice(-2), ["-a", "42"])
+  assert.deepEqual(Model.networksSelectCommand(42).slice(-3), ["-a", "--", "42"])
+})
+
+// The id is management-controlled: it is read out of `netbird networks list`,
+// whose rows the management server supplies. netbird's flag parser reads an
+// operand beginning with `-` as a flag wherever it sits — on 0.77.0
+// `netbird networks deselect --help` prints help rather than looking for a
+// route of that name — so `--` is what keeps the id an operand.
+test("network ids cannot reach netbird's flag parser", () => {
+  for (const id of ["--help", "--daemon-addr=tcp://attacker.example:33073", "-a"]) {
+    for (const build of [Model.networksSelectCommand, Model.networksDeselectCommand]) {
+      const argv = build(id)
+      assert.equal(argv[argv.length - 1], id, id)
+      assert.equal(argv[argv.length - 2], "--", id)
+    }
+  }
 })
 
 // --- peer detail ------------------------------------------------------------
@@ -1135,7 +1150,7 @@ test("identity is the id, so two profiles with one name stay distinct", () => {
     const decision = Model.resolveProfileSelection(rows, row.id)
     assert.deepEqual(decision, { ok: true, reason: "", id: row.id })
     assert.deepEqual(Model.profileSelectCommand(decision.id),
-      ["timeout", "-k", "2", "8", "netbird", "profile", "select", row.id])
+      ["timeout", "-k", "2", "8", "netbird", "profile", "select", "--", row.id])
   }
 })
 
@@ -1269,13 +1284,18 @@ test("a free-form profile name never becomes shell syntax", () => {
   const rows = Model.parseProfileTable(GO_TABLE_NO_IDS).profiles
   for (const row of rows) {
     const argv = Model.profileSelectCommand(row.id)
-    assert.equal(argv.length, 8)
+    assert.equal(argv.length, 9)
     assert.equal(argv[argv.length - 1], row.id)
-    assert.deepEqual(argv.slice(0, 7), ["timeout", "-k", "2", "8", "netbird", "profile", "select"])
+    assert.deepEqual(argv.slice(0, 8), ["timeout", "-k", "2", "8", "netbird", "profile", "select", "--"])
   }
   const nasty = "prod; rm -rf ~ && echo"
   assert.deepEqual(Model.profileSelectCommand(nasty).slice(-1), [nasty])
-  assert.equal(Model.profileSelectCommand(nasty).length, 8)
+  assert.equal(Model.profileSelectCommand(nasty).length, 9)
+
+  // A profile is local rather than management-supplied, so this is defence in
+  // depth rather than the reported bug — but a legacy CLI's id-less table takes
+  // the display name as the handle, and a name may begin with a hyphen.
+  assert.deepEqual(Model.profileSelectCommand("--help").slice(-2), ["--", "--help"])
 })
 
 test("profile commands are timeout-wrapped argv vectors, id-first", () => {
@@ -1287,7 +1307,7 @@ test("profile commands are timeout-wrapped argv vectors, id-first", () => {
   assert.deepEqual(Model.profileListCommand(false),
     ["timeout", "-k", "2", "8", "netbird", "profile", "list"])
   assert.deepEqual(Model.profileSelectCommand("ab12cd34"),
-    ["timeout", "-k", "2", "8", "netbird", "profile", "select", "ab12cd34"])
+    ["timeout", "-k", "2", "8", "netbird", "profile", "select", "--", "ab12cd34"])
 })
 
 test("a CLI that rejects --show-id is recognised, not retried forever", () => {
@@ -1503,6 +1523,19 @@ test("adminConsoleUrl derives from the management URL and yields to the setting"
   // Nothing to derive from and nothing set means no button.
   assert.equal(Model.adminConsoleUrl("", ""), "")
   assert.equal(Model.adminConsoleUrl(null, null), "")
+
+  // The management URL is the daemon's answer, so the scheme is attacker-chosen
+  // and the result is handed to a browser. Only http(s) is a console; anything
+  // else yields no link rather than opening a local file.
+  assert.equal(Model.adminConsoleUrl("http://netbird.example", ""), "http://netbird.example")
+  for (const hostile of ["file://localhost/etc/passwd", "file:///etc/shadow",
+                         "javascript://x/%0Aalert(1)", "data://text/html,x",
+                         "vbscript://x", "smb://attacker.example/share"]) {
+    assert.equal(Model.adminConsoleUrl(hostile, ""), "", hostile)
+  }
+
+  // A scheme-less management URL is still assumed https, as before.
+  assert.equal(Model.adminConsoleUrl("netbird.example:443", ""), "https://netbird.example")
 })
 
 // --- review fixes -----------------------------------------------------------
