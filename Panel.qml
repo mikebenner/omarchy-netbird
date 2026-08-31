@@ -1329,6 +1329,10 @@ Panel {
     property int rowIndex: 0
     readonly property string peerName: peer ? String(peer.name || "Unknown") : "Unknown"
     readonly property string peerIp: peer ? String(peer.ip || "") : ""
+    // SSH and ping are offered only for an address the builders will actually
+    // launch. A non-empty IP was the old test, and it let a peer the management
+    // server named `-oProxyCommand=…` show buttons that must never have existed.
+    readonly property bool peerAddressable: Model.isPeerAddress(peerIp)
     readonly property string peerFqdn: peer ? String(peer.fqdn || "") : ""
     readonly property string peerKey: peer ? String(peer.publicKey || "") : ""
     readonly property bool peerDimmed: peer ? peer.dimmed === true : true
@@ -1439,7 +1443,7 @@ Panel {
       }
 
       PanelActionButton {
-        visible: peerRow.peer && peerRow.peer.online === true && peerRow.peerIp !== ""
+        visible: peerRow.peer && peerRow.peer.online === true && peerRow.peerAddressable
         iconText: "󰆍"
         tooltipText: "SSH to this peer (s)"
         foreground: root.foreground
@@ -1449,7 +1453,7 @@ Panel {
       }
 
       PanelActionButton {
-        visible: peerRow.peer && peerRow.peer.online === true && peerRow.peerIp !== ""
+        visible: peerRow.peer && peerRow.peer.online === true && peerRow.peerAddressable
         // A plain Unicode arrow pair, not a Nerd Font codepoint: the icon this
         // slot first used has no glyph in the bar font and fell back to a
         // letter box. Verified rendering in JetBrainsMono Nerd Font.

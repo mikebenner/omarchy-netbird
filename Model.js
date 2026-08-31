@@ -1365,12 +1365,117 @@ function profileSelectCommand(handle) {
     .concat(["netbird", "profile", "select", normalizeProfileHandle(handle)])
 }
 
+// --- peer actions -----------------------------------------------------------
+//
+// A peer's address is whatever the management server put in the daemon's status
+// output. It is not the local user's input, so it is exactly the kind of value a
+// command line may not be built from naively — and an argv vector on its own is
+// not enough to make it safe. `ssh -oProxyCommand=… host` runs the ProxyCommand,
+// and passing `-oProxyCommand=…` as a single argv element changes nothing: `ssh`
+// still parses it as an option. Two independent defences, and both stay, because
+// either alone is a single point of failure:
+//
+//   * `--` ends option parsing, so the callee reads the address as an operand
+//     whatever it begins with. Structural, and holds even if the shape check
+//     below turns out to be wrong about some address.
+//   * the shape check refuses to build a command at all for anything that is not
+//     an IP or a DNS name — which is what covers a value that is not an option
+//     but is still not an address.
+
+// Bounded to what `inet_aton` would read as an octet, and leading zeros are
+// refused: `010` is octal there, so `100.64.0.010` and `100.64.0.8` would be the
+// same host while reading as different ones.
+var IPV4_OCTET = /^(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$/
+
+function isIpv4Address(text) {
+  var parts = String(text).split(".")
+  if (parts.length !== 4) return false
+  for (var i = 0; i < parts.length; i++) {
+    if (!IPV4_OCTET.test(parts[i])) return false
+  }
+  return true
+}
+
+var IPV6_GROUP = /^[0-9A-Fa-f]{1,4}$/
+
+// Structural rather than one long pattern, because the rules are structural: at
+// most one `::`, at most eight 16-bit groups, and a trailing dotted quad standing
+// in for the last two. A zone id (`%eth0`) is deliberately not accepted — it
+// cannot occur in a NetBird overlay address and it would widen the charset.
+function isIpv6Address(text) {
+  var value = String(text)
+  if (value.indexOf(":") === -1) return false
+
+  var halves = value.split("::")
+  if (halves.length > 2) return false
+  var compressed = halves.length === 2
+
+  var head = halves[0] === "" ? [] : halves[0].split(":")
+  var tail = !compressed || halves[1] === "" ? [] : halves[1].split(":")
+  var groups = head.concat(tail)
+  var width = groups.length
+
+  if (width > 0 && groups[width - 1].indexOf(".") !== -1) {
+    if (!isIpv4Address(groups[width - 1])) return false
+    groups = groups.slice(0, width - 1)
+    width = groups.length + 2
+  }
+
+  for (var i = 0; i < groups.length; i++) {
+    if (!IPV6_GROUP.test(groups[i])) return false
+  }
+
+  // `::` stands for at least one group, so a compressed address is short by
+  // definition; an uncompressed one has to be complete.
+  return compressed ? width < 8 : width === 8
+}
+
+// The letter-digit-hyphen form, which is what NetBird's own `fqdn` field carries.
+// Bounded the way DNS bounds it, and a label may neither open nor close with a
+// hyphen — which is also what keeps the whole string from ever beginning with the
+// `-` that made this a vulnerability in the first place.
+var DNS_LABEL = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/
+var DNS_ALL_DIGITS = /^[0-9]+$/
+var DNS_NAME_MAX = 253
+
+function isDnsName(text) {
+  var value = String(text)
+  // One trailing dot is the root label and is a legal way to write a name.
+  if (value.charAt(value.length - 1) === ".") value = value.slice(0, -1)
+  if (value === "" || value.length > DNS_NAME_MAX) return false
+
+  var labels = value.split(".")
+  // An FQDN, not a bare hostname: a name with no dot in it is not one, and
+  // refusing the single-label form keeps the accepted set as small as the
+  // feature actually needs.
+  if (labels.length < 2) return false
+  for (var i = 0; i < labels.length; i++) {
+    if (!DNS_LABEL.test(labels[i])) return false
+  }
+  // A final label of digits only would be a malformed IPv4 rather than a name.
+  return !DNS_ALL_DIGITS.test(labels[labels.length - 1])
+}
+
+function isPeerAddress(address) {
+  var text = String(address === undefined || address === null ? "" : address)
+  if (text === "") return false
+  return isIpv4Address(text) || isIpv6Address(text) || isDnsName(text)
+}
+
+// Returns null rather than a command when the address is not one, so the caller
+// launches nothing at all. Rejecting is the point: passing the value on and
+// trusting the callee to cope with it is what was wrong before.
+function peerActionCommand(tool, address) {
+  if (!isPeerAddress(address)) return null
+  return ["omarchy-launch-terminal", tool, "--", String(address)]
+}
+
 function sshCommand(address) {
-  return ["omarchy-launch-terminal", "ssh", String(address)]
+  return peerActionCommand("ssh", address)
 }
 
 function pingCommand(address) {
-  return ["omarchy-launch-terminal", "ping", String(address)]
+  return peerActionCommand("ping", address)
 }
 
 // --- admin console ----------------------------------------------------------
@@ -1570,6 +1675,7 @@ if (typeof module !== "undefined") {
     rejectsShowId: rejectsShowId,
     profileListCommand: profileListCommand,
     profileSelectCommand: profileSelectCommand,
+    isPeerAddress: isPeerAddress,
     sshCommand: sshCommand,
     pingCommand: pingCommand,
     adminConsoleUrl: adminConsoleUrl,
