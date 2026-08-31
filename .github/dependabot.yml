@@ -1,0 +1,12 @@
+# Dependabot keeps the workflow's actions current. Nothing else here has
+# dependencies to watch: `Model.js` is plain JavaScript with a CommonJS export
+# and the tests use Node's built-in runner, so there is no package.json and no
+# lockfile — hence no npm ecosystem below.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci

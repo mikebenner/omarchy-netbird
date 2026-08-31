@@ -1,0 +1,39 @@
+{
+  "peers": {
+    "total": 0,
+    "connected": 0,
+    "details": []
+  },
+  "cliVersion": "0.77.1",
+  "daemonVersion": "0.77.1",
+  "daemonStatus": "Idle",
+  "management": {
+    "url": "https://netbird.example:443",
+    "connected": false,
+    "error": ""
+  },
+  "signal": {
+    "url": "https://netbird.example:443",
+    "connected": false,
+    "error": ""
+  },
+  "relays": {
+    "total": 1,
+    "available": 0,
+    "details": [
+      { "uri": "rels://relay.netbird.example:443", "available": false, "error": "relay connection is not established" }
+    ]
+  },
+  "netbirdIp": "",
+  "usesKernelInterface": false,
+  "wireguardPort": 0,
+  "fqdn": "",
+  "quantumResistance": false,
+  "quantumResistancePermissive": false,
+  "networks": null,
+  "forwardingRules": 0,
+  "dnsServers": [],
+  "lazyConnectionEnabled": false,
+  "profileName": "default",
+  "sshServer": { "enabled": false, "sessions": [] }
+}

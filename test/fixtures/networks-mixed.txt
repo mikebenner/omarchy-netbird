@@ -1,0 +1,13 @@
+Available Networks:
+
+  - ID: office-lan
+    Network: 10.10.0.0/16
+    Status: Selected
+
+  - ID: datacentre
+    Network: 192.168.50.0/24
+    Status: Not Selected
+
+  - ID: full-tunnel
+    Network: 0.0.0.0/0
+    Status: Not Selected

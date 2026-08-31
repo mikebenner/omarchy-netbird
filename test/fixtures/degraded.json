@@ -1,0 +1,57 @@
+{
+  "peers": {
+    "total": 2,
+    "connected": 2,
+    "details": [
+      {
+        "fqdn": "atlas.netbird.example",
+        "netbirdIp": "100.64.12.5",
+        "publicKey": "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789ABCDEF2=",
+        "status": "Connected",
+        "connectionType": "P2P",
+        "relayAddress": "",
+        "lastWireguardHandshake": "2026-08-30T00:40:52Z",
+        "latency": 2400000,
+        "networks": null
+      },
+      {
+        "fqdn": "builder.netbird.example",
+        "netbirdIp": "100.70.4.16",
+        "publicKey": "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789ABCDEF3=",
+        "status": "Connected",
+        "connectionType": "Relayed",
+        "relayAddress": "rels://relay.netbird.example:443",
+        "lastWireguardHandshake": "2026-08-30T00:40:11Z",
+        "latency": 143000000,
+        "networks": null
+      }
+    ]
+  },
+  "cliVersion": "0.77.1",
+  "daemonVersion": "0.77.1",
+  "daemonStatus": "Connected",
+  "management": {
+    "url": "https://netbird.example:443",
+    "connected": false,
+    "error": "context deadline exceeded"
+  },
+  "signal": {
+    "url": "https://netbird.example:443",
+    "connected": true,
+    "error": ""
+  },
+  "relays": {
+    "total": 2,
+    "available": 1,
+    "details": []
+  },
+  "netbirdIp": "100.64.0.9/16",
+  "publicKey": "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789ABCDEF4=",
+  "fqdn": "laptop.netbird.example",
+  "networks": null,
+  "dnsServers": [],
+  "lazyConnectionEnabled": true,
+  "profileName": "default",
+  "sessionExpiresAt": "2026-08-31T06:41:06Z",
+  "sshServer": { "enabled": false, "sessions": [] }
+}

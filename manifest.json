@@ -1,0 +1,57 @@
+{
+  "schemaVersion": 1,
+  "id": "mikebenner.netbird",
+  "name": "NetBird",
+  "version": "0.1.0",
+  "author": "Michael Benner",
+  "license": "MIT",
+  "homepage": "https://github.com/mikebenner/omarchy-netbird",
+  "description": "NetBird status, peer browsing, and quick copy actions in the Omarchy bar.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "NetBird",
+    "description": "Toggle NetBird, browse peers, and copy peer IPs or names.",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 30,
+      "iconStyle": "theme",
+      "adminConsoleUrl": ""
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 5,
+        "max": 3600,
+        "step": 5,
+        "defaultValue": 30
+      },
+      {
+        "key": "iconStyle",
+        "type": "enum",
+        "label": "Icon style",
+        "options": [
+          "theme",
+          "color"
+        ],
+        "defaultValue": "theme",
+        "description": "theme draws the NetBird mark in your theme's colours and follows a theme switch; color shows NetBird's own coloured tray artwork."
+      },
+      {
+        "key": "adminConsoleUrl",
+        "type": "string",
+        "label": "Admin console URL",
+        "defaultValue": "",
+        "description": "Overrides the derived admin console link. Left empty the URL comes from the management URL, and NetBird Cloud maps to https://app.netbird.io automatically — set this only for a split dashboard host of your own."
+      }
+    ]
+  }
+}

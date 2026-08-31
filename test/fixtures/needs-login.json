@@ -1,0 +1,38 @@
+{
+  "peers": {
+    "total": 0,
+    "connected": 0,
+    "details": []
+  },
+  "cliVersion": "0.77.1",
+  "daemonVersion": "0.77.1",
+  "daemonStatus": "NeedsLogin",
+  "management": {
+    "url": "https://netbird.example:443",
+    "connected": false,
+    "error": "peer is not registered"
+  },
+  "signal": {
+    "url": "https://netbird.example:443",
+    "connected": false,
+    "error": ""
+  },
+  "relays": {
+    "total": 0,
+    "available": 0,
+    "details": []
+  },
+  "netbirdIp": "",
+  "usesKernelInterface": false,
+  "wireguardPort": 0,
+  "fqdn": "",
+  "quantumResistance": false,
+  "quantumResistancePermissive": false,
+  "networks": null,
+  "forwardingRules": 0,
+  "dnsServers": [],
+  "lazyConnectionEnabled": false,
+  "profileName": "default",
+  "sessionExpiresAt": "0001-01-01T00:00:00Z",
+  "sshServer": { "enabled": false, "sessions": [] }
+}

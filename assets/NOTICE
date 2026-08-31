@@ -1,0 +1,51 @@
+NetBird artwork
+===============
+
+The NetBird mark used by this widget comes from the NetBird client, unmodified:
+
+    https://github.com/netbirdio/netbird
+    commit 11733fd718fb7889cfbf8b4e6498c0b4e74a1eb0 (2026-08-28)
+
+(c) 2022 NetBird GmbH & AUTHORS, licensed BSD-3-Clause. The upstream repository
+places management/, signal/, relay/ and combined/ under AGPLv3; client/ui/ is
+not among them, so this artwork is BSD-3-Clause.
+
+Vector geometry (default "theme" style)
+---------------------------------------
+
+The two wing paths in NetbirdIcon.qml are copied verbatim from
+
+    client/ui/frontend/src/assets/logos/netbird.svg
+    sha256 64773bd313506a921e51558fdb0c243da6fb0c0df0a81c1f2cd4bc733a54838e
+
+so the widget can draw the mark in the current theme's colours at any size.
+That file carries three paths; the third fills the overlap between the two
+wings in a second colour, which changes nothing once every path is drawn in one
+colour, so it is not reproduced. The same geometry appears upstream at
+client/ui/assets/svg/netbird-menu.svg and proxy/web/src/assets/netbird.svg.
+
+The state badges (check, dots, cross) are drawn by this widget rather than
+copied; they mirror the badges on the tray PNGs below.
+
+Bitmaps (opt-in "color" style)
+------------------------------
+
+From client/ui/assets/, used as-is:
+
+    netbird-systemtray-<state>.png   256x256
+
+for <state> in connected, connecting, disconnected, error, needs-login. At this
+commit netbird-systemtray-needs-login.png is byte-identical to
+netbird-systemtray-error.png; both names ship so the widget's state-to-file
+mapping stays a plain lookup.
+
+Verification
+------------
+
+    sha256sum netbird-systemtray-*.png
+
+    c50cc0439620539802ca65e679ddfbb8133ee25d1a98ffbfd52f86ea2ced252b  netbird-systemtray-connected.png
+    aafadaaf136d8a62d1cfb5e9b99700a302241edcca01eddb106420b38c38ef23  netbird-systemtray-connecting.png
+    71b133636e91eb67f221f64592f64fa04a3b2337f4d616be36492efae0cff643  netbird-systemtray-disconnected.png
+    eb0cb09f427d8bace3ce98c32fc5deb78a9a045dac3fed2d2695110ed7160d14  netbird-systemtray-error.png
+    eb0cb09f427d8bace3ce98c32fc5deb78a9a045dac3fed2d2695110ed7160d14  netbird-systemtray-needs-login.png
