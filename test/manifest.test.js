@@ -130,13 +130,30 @@ test("the CI workflow runs the same command that passes locally", () => {
   const body = fs.readFileSync(workflow, "utf8")
 
   assert.ok(body.includes("node --test test/"), "CI must run the local test command")
-  // Pinned by major, and first-party only — no third-party actions.
-  assert.ok(body.includes("actions/checkout@v4"))
-  assert.ok(body.includes("actions/setup-node@v4"))
+  // Both steps are still there, but the *version* is deliberately not frozen
+  // here: Dependabot raises the majors, and a hard-coded number would fail
+  // this test on its own update PR. What must hold is the rule — first-party
+  // actions only, each pinned to a version tag rather than a moving branch.
+  assert.ok(/actions\/checkout@v\d/.test(body), "CI must check the repository out")
+  assert.ok(/actions\/setup-node@v\d/.test(body), "CI must set up Node")
   for (const line of body.split("\n")) {
     const uses = line.match(/^\s*-?\s*uses:\s*(\S+)/)
     if (!uses) continue
     assert.ok(uses[1].startsWith("actions/"), `third-party action not allowed: ${uses[1]}`)
-    assert.ok(uses[1].includes("@"), `action must be version-pinned: ${uses[1]}`)
+    assert.ok(/^actions\/[\w.-]+@v\d+(\.\d+){0,2}$/.test(uses[1]),
+      `action must be pinned to a version tag: ${uses[1]}`)
   }
+})
+
+test("dependabot watches what the repository actually has", () => {
+  // The workflow's actions are the only moving parts; there is no
+  // package.json, so an npm ecosystem entry would watch nothing.
+  const config = path.join(ROOT, ".github", "dependabot.yml")
+  assert.ok(fs.existsSync(config), "dependabot.yml is missing")
+  const body = fs.readFileSync(config, "utf8")
+  assert.ok(/version:\s*2/.test(body), "dependabot config must declare version 2")
+  assert.ok(/package-ecosystem:\s*github-actions/.test(body), "the actions ecosystem must be watched")
+  assert.ok(/interval:\s*\w+/.test(body), "an update schedule is required")
+  assert.equal(fs.existsSync(path.join(ROOT, "package.json")), false,
+    "a package.json now exists — dependabot should watch npm too")
 })
