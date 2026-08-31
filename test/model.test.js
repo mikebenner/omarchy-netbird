@@ -1505,6 +1505,66 @@ test("no accepted address can begin with a hyphen", () => {
   }
 })
 
+test("the character classes are ASCII, and that is the safety rather than a hole", () => {
+  // `[A-Za-z0-9]` without `/u` matches no Unicode hyphen, no bidi control and no
+  // fullwidth digit, so none of these can open a label or stand in for an octet.
+  const unicode = [
+    "‐a.example",       // hyphen
+    "−a.example",       // minus sign
+    "－a.example",       // fullwidth hyphen-minus
+    "﹣a.example",       // small hyphen-minus
+    "​a.example",       // zero-width space
+    "‏a.example",       // right-to-left mark
+    "１００.64.0.9", // fullwidth digits
+    "peer\u0000.example",   // NUL, escaped rather than a raw byte
+    "my_laptop.netbird.cloud",   // underscore is not an LDH label
+    "0x7f.0.0.1",            // inet_aton hex form
+  ]
+  for (const address of unicode) {
+    assert.equal(Model.isPeerAddress(address), false, JSON.stringify(address))
+    assert.equal(Model.sshCommand(address), null, JSON.stringify(address))
+  }
+})
+
+test("a dotted quad counts only where it is genuinely last", () => {
+  // `::` ends the address, so there is no final group for a dotted quad to be.
+  // Reading it off the head instead let `192.0.2.1::` pass as an IPv6 address.
+  for (const address of ["192.0.2.1::", "1:192.0.2.1::", "::192.0.2.1:1",
+                         "192.0.2.1::1"]) {
+    assert.equal(Model.isPeerAddress(address), false, address)
+    assert.equal(Model.sshCommand(address), null, address)
+  }
+  // Where it really is last, in both the compressed and the uncompressed form.
+  assert.equal(Model.isPeerAddress("::ffff:192.0.2.128"), true)
+  assert.equal(Model.isPeerAddress("0:0:0:0:0:0:192.0.2.1"), true)
+  // The NetBird ULA shape, as a self-hosted deployment issues it.
+  assert.equal(Model.isPeerAddress("fd00:1234:5678::1f"), true)
+  // An internationalised domain in the form DNS actually carries it.
+  assert.equal(Model.isPeerAddress("xn--e1afmkfd.xn--p1ai"), true)
+})
+
+test("the address is stringified once, so the check and the argv agree", () => {
+  // An object whose `toString` answers differently the second time would
+  // otherwise pass the check and put something else on the command line.
+  let calls = 0
+  const shifty = {
+    toString() {
+      calls += 1
+      return calls === 1 ? "100.64.0.9" : "-oProxyCommand=id"
+    },
+  }
+  assert.deepEqual(Model.sshCommand(shifty),
+    ["omarchy-launch-terminal", "ssh", "--", "100.64.0.9"])
+
+  // Whatever argv carries is a value that passed the check.
+  for (const odd of [["100.64.0.9"], new String("100.64.0.9")]) {
+    const argv = Model.pingCommand(odd)
+    assert.ok(argv, String(odd))
+    assert.equal(typeof argv[3], "string")
+    assert.equal(Model.isPeerAddress(argv[3]), true, argv[3])
+  }
+})
+
 // --- admin console ----------------------------------------------------------
 
 test("adminConsoleUrl derives from the management URL and yields to the setting", () => {

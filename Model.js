@@ -1423,21 +1423,27 @@ function isIpv6Address(text) {
 
   var head = halves[0] === "" ? [] : halves[0].split(":")
   var tail = !compressed || halves[1] === "" ? [] : halves[1].split(":")
-  var groups = head.concat(tail)
-  var width = groups.length
 
-  if (width > 0 && groups[width - 1].indexOf(".") !== -1) {
-    if (!isIpv4Address(groups[width - 1])) return false
-    groups = groups.slice(0, width - 1)
-    width = groups.length + 2
+  // A dotted quad stands in for the last two groups, so it is one only where it
+  // is genuinely last: the final group of the tail when the address has a tail,
+  // of the head when nothing is compressed. An address ending in `::` has no
+  // final group at all, which is what makes `192.0.2.1::` not an address.
+  var trailing = compressed ? tail : head
+  var embedded = 0
+  if (trailing.length > 0 && trailing[trailing.length - 1].indexOf(".") !== -1) {
+    if (!isIpv4Address(trailing[trailing.length - 1])) return false
+    trailing.pop()
+    embedded = 2
   }
 
+  var groups = head.concat(tail)
   for (var i = 0; i < groups.length; i++) {
     if (!IPV6_GROUP.test(groups[i])) return false
   }
 
   // `::` stands for at least one group, so a compressed address is short by
   // definition; an uncompressed one has to be complete.
+  var width = groups.length + embedded
   return compressed ? width < 8 : width === 8
 }
 
@@ -1476,9 +1482,16 @@ function isPeerAddress(address) {
 // Returns null rather than a command when the address is not one, so the caller
 // launches nothing at all. Rejecting is the point: passing the value on and
 // trusting the callee to cope with it is what was wrong before.
+// Stringified once, and it is that snapshot which is both checked and sent, so
+// the check and the argv cannot disagree about what was approved — the same
+// reason `profileSelectCommand` sends the handle `resolveProfileSelection`
+// normalised. Converting twice would let an object whose `toString` answers
+// differently on the second call pass the check and put something else on the
+// command line.
 function peerActionCommand(tool, address) {
-  if (!isPeerAddress(address)) return null
-  return ["omarchy-launch-terminal", tool, "--", String(address)]
+  var text = String(address === undefined || address === null ? "" : address)
+  if (!isPeerAddress(text)) return null
+  return ["omarchy-launch-terminal", tool, "--", text]
 }
 
 function sshCommand(address) {
