@@ -45,7 +45,7 @@ menus. Everything it knows comes from the `netbird` CLI.
 | Needs | Why | Arch package |
 |---|---|---|
 | Omarchy with the quickshell shell | Hosts the plugin; provides `omarchy plugin`, `omarchy bar` and `omarchy-launch-browser` | `omarchy` (developed against 4.0.1) |
-| `netbird` CLI **and** a running daemon | Every piece of state comes from `netbird status --json`; the toggle runs `netbird up` / `netbird down` | `netbird-bin` (developed against 0.77.1) |
+| `netbird` CLI **and** a running daemon | Every piece of state comes from `netbird status --json`; the toggle runs `netbird up` / `netbird down` | `netbird-bin` (developed against 0.77.0 and 0.77.1) |
 | `wl-copy` | The copy actions on the device and peer rows | `wl-clipboard` |
 | `omarchy-launch-browser` | Opens the SSO URL when the daemon needs to re-authenticate | ships with `omarchy` |
 
@@ -340,7 +340,8 @@ Deliberate edges, each chosen over guessing:
   internationalised management URL and its punycode spelling
   (`bücher.example` vs `xn--bcher-kva.example`) do not compare equal.
 - `netbird networks list` has no `--json`, so its output is parsed as text
-  against the format NetBird 0.77.1 prints. A row ships only when its block
+  against the format NetBird 0.77.0 and 0.77.1 print (the two are
+  identical here). A row ships only when its block
   carries an id, a `Network:` or `Domains:` line, and a `Status:` value the
   printer actually emits — so a release that renames those fields shows an
   empty NETWORKS section rather than rows that lie.
