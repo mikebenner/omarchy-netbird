@@ -104,17 +104,18 @@ test("the idle stand-in mirrors every property and function the service exposes"
   }
 })
 
-test("the peer search field exists only while the search is open", () => {
-  // Marketplace review of 1.0.0: a Qt text input, even hidden, keeps the
-  // clipboard's paste state fresh, which on Wayland reads foreign clipboard
-  // contents with no size or time bound. Create it on demand, never at build.
-  const src = read("Panel.qml")
-  const loader = src.indexOf("id: peerSearchLoader")
-  assert.ok(loader > 0, "the search field sits behind a Loader")
-  const block = src.slice(loader, loader + 600)
-  assert.match(block, /active: root\.searchOpen/)
-  assert.match(block, /sourceComponent: TextField \{/)
-  assert.doesNotMatch(src.replace(block, ""), /\n\s*TextField \{\s*\n\s*id: peerSearch\b/, "no second, eagerly built search field")
+test("no native text input exists in the panel, open or not", () => {
+  // Marketplace review of 1.0.0 and 1.0.1: a Qt text input subscribes to the
+  // clipboard's changes and reads them, unbounded, on Wayland, even while
+  // hidden. The peer filter is typed through a plain focus item instead.
+  for (const name of QML) {
+    const src = code(read(name))
+    assert.doesNotMatch(src, /\b(TextField|TextInput|TextArea|TextEdit)\s*\{/, `${name} declares a native text input`)
+  }
+  const panel = read("Panel.qml")
+  assert.match(panel, /id: peerSearchKeys/)
+  assert.match(panel, /Keys\.onPressed: function\(event\)/)
+  assert.match(panel, /function setPeerQuery\(value\)/)
 })
 
 test("the documented IPC surface is present", () => {

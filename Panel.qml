@@ -336,9 +336,13 @@ Panel {
     Qt.callLater(function() { if (peerSearch) peerSearch.forceActiveFocus() })
   }
 
+  function setPeerQuery(value) {
+    peerQuery = String(value || "")
+    peerIndex = 0
+  }
+
   function closeSearch() {
     searchOpen = false
-    if (peerSearch) peerSearch.text = ""
     peerQuery = ""
     peerIndex = 0
     if (root.opened) Qt.callLater(function() { if (panel.loadedContent) panel.loadedContent.forceActiveFocus() })
@@ -361,7 +365,6 @@ Panel {
       // field reappears on the next open, showing over an unfiltered list, and
       // an expanded peer stays expanded for a mesh that has since changed.
       searchOpen = false
-      if (peerSearch) peerSearch.text = ""
       peerQuery = ""
       peerIndex = 0
       networkIndex = 0
@@ -429,7 +432,6 @@ Panel {
   QtObject {
     id: idle
     property int openPanels: 0
-    property bool panelOpen: false
     property var settings: ({})
     property bool installed: false
     property bool running: false
@@ -625,13 +627,15 @@ Panel {
       id: keyCatcher
       property alias panelFlick: panelFlick
       property alias peerColumn: peerColumn
-      readonly property Item peerSearch: peerSearchLoader.item
+      property alias peerSearch: peerSearchKeys
       property alias selfRow: selfRow
       implicitHeight: column.implicitHeight
       anchors.fill: parent
       // Blocked while a copy menu is up or the filter field has focus, so
       // typed characters land in the field rather than firing shortcuts.
-      blocked: root.copyMenuOpen || (root.searchOpen && peerSearch !== null && peerSearch.activeFocus)
+      // Blocked while a copy menu is up or the search has focus, so typed
+      // characters reach them rather than firing shortcuts.
+      blocked: root.copyMenuOpen || (root.searchOpen && peerSearchKeys.activeFocus)
       onMoveRequested: function(dx, dy) {
         // The first press only reveals the cursor — but it still has to land
         // somewhere visible, so settle the section before returning.
@@ -1038,44 +1042,62 @@ Panel {
               }
             }
 
-            // Opened with `/`. While it has focus the panel's key catcher is
-            // blocked, so typed characters reach the field instead of being
-            // read as shortcuts. The field exists only while the search is
-            // open: a Qt text input keeps the clipboard's paste state fresh
-            // even while hidden, and on Wayland that has the shell read
-            // whatever another client offers, with no bound on size or time.
-            Loader {
-              id: peerSearchLoader
-              active: root.searchOpen
-              visible: active
+            // Opened with `/`. There is no text input in this panel, ever: a Qt
+            // text input subscribes to the clipboard's changes and reads them,
+            // unbounded, on Wayland. The query is typed through a plain focus
+            // item that only ever sees the keys you press, and shown as text.
+            Item {
+              id: peerSearchKeys
+              visible: root.searchOpen
               width: parent.width
+              implicitHeight: visible ? searchText.implicitHeight + Style.space(10) : 0
+              focus: root.searchOpen
 
-              sourceComponent: TextField {
-                id: peerSearch
-                width: peerSearchLoader.width
-                foreground: root.foreground
-                placeholderText: "Filter peers — name, address, transport, state"
-                // One-way: the field is the source of truth and `peerQuery`
-                // follows it. Binding `text` back to `peerQuery` meant clearing
-                // the property on close did not necessarily clear the field, so
-                // `/` reopened showing a stale query over an unfiltered list.
-                onTextChanged: {
-                  root.peerQuery = text
-                  root.peerIndex = 0
+              Keys.onPressed: function(event) {
+                if (event.key === Qt.Key_Escape) {
+                  root.closeSearch()
+                  event.accepted = true
+                  return
                 }
-                Keys.onPressed: function(event) {
-                  if (event.key === Qt.Key_Escape) {
-                    root.closeSearch()
-                    event.accepted = true
-                    return
-                  }
-                  if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Down) {
-                    root.cursorActive = true
-                    root.focusSection = "peers"
-                    keyCatcher.forceActiveFocus()
-                    event.accepted = true
-                  }
+                if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Down) {
+                  root.cursorActive = true
+                  root.focusSection = "peers"
+                  keyCatcher.forceActiveFocus()
+                  event.accepted = true
+                  return
                 }
+                if (event.key === Qt.Key_Backspace) {
+                  root.setPeerQuery(root.peerQuery.slice(0, -1))
+                  event.accepted = true
+                  return
+                }
+                if (event.modifiers & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier)) return
+                var typed = String(event.text || "")
+                if (typed.length === 0 || typed.charCodeAt(0) < 32) return
+                root.setPeerQuery(root.peerQuery + typed)
+                event.accepted = true
+              }
+
+              Rectangle {
+                anchors.fill: parent
+                color: "transparent"
+                border.width: 1
+                border.color: peerSearchKeys.activeFocus ? root.foreground : root.dim
+              }
+
+              Text {
+                id: searchText
+                textFormat: Text.PlainText
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                anchors.leftMargin: Style.space(8)
+                anchors.rightMargin: Style.space(8)
+                text: root.peerQuery === "" ? "Filter peers: type a name, address, transport or state" : root.peerQuery + "\u258f"
+                color: root.peerQuery === "" ? root.dim : root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                elide: Text.ElideLeft
               }
             }
 

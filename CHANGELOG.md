@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.2 — 2026-10-16
+
+The peer filter no longer uses a text input at all. Typing goes through a plain focus item that only ever sees the keys you press, and the query is shown as text, so nothing in the panel subscribes to the clipboard. Replaces the 1.0.1 change, which still created the input while the search was open.
+
+Fixed: 1.0.0 and 1.0.1 declared `panelOpen` twice on the widget's idle stand-in, a QML error that kept the bar widget from loading. A smoke test (`test/smoke.sh`) now loads both files against the installed kit so this cannot slip through again.
+
 ## 1.0.1 — 2026-10-16
 
 The peer search field is created only while the search is open. A Qt text input keeps the clipboard's paste state fresh even while hidden, and on Wayland that means the shell reads whatever another client offers on the clipboard, with no bound on size or time; raised by the marketplace's review of 1.0.0.

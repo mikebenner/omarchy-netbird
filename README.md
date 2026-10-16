@@ -28,7 +28,9 @@ The bar glyph alone tells you what the tunnel is doing: connected, degraded (man
   it to `omarchy-launch-browser`. The device code the CLI prints is shown
   large in the panel with a copy button and a cancel button beside it.
 - Filter the peer list with `/` — matches name, FQDN, address, transport and
-  state, and the section header counts what is showing
+  state, and the section header counts what is showing. The filter is typed
+  through the panel's own key handling, not a text input, so the panel never
+  touches the clipboard
 - Tells you when the **daemon itself** is not running, instead of showing a
   stale peer list
 - **Networks**: every route the daemon offers, with a switch per row and
