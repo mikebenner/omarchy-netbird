@@ -625,13 +625,13 @@ Panel {
       id: keyCatcher
       property alias panelFlick: panelFlick
       property alias peerColumn: peerColumn
-      property alias peerSearch: peerSearch
+      readonly property Item peerSearch: peerSearchLoader.item
       property alias selfRow: selfRow
       implicitHeight: column.implicitHeight
       anchors.fill: parent
       // Blocked while a copy menu is up or the filter field has focus, so
       // typed characters land in the field rather than firing shortcuts.
-      blocked: root.copyMenuOpen || (root.searchOpen && peerSearch.activeFocus)
+      blocked: root.copyMenuOpen || (root.searchOpen && peerSearch !== null && peerSearch.activeFocus)
       onMoveRequested: function(dx, dy) {
         // The first press only reveals the cursor — but it still has to land
         // somewhere visible, so settle the section before returning.
@@ -1040,32 +1040,41 @@ Panel {
 
             // Opened with `/`. While it has focus the panel's key catcher is
             // blocked, so typed characters reach the field instead of being
-            // read as shortcuts.
-            TextField {
-              id: peerSearch
-              visible: root.searchOpen
+            // read as shortcuts. The field exists only while the search is
+            // open: a Qt text input keeps the clipboard's paste state fresh
+            // even while hidden, and on Wayland that has the shell read
+            // whatever another client offers, with no bound on size or time.
+            Loader {
+              id: peerSearchLoader
+              active: root.searchOpen
+              visible: active
               width: parent.width
-              foreground: root.foreground
-              placeholderText: "Filter peers — name, address, transport, state"
-              // One-way: the field is the source of truth and `peerQuery`
-              // follows it. Binding `text` back to `peerQuery` meant clearing
-              // the property on close did not necessarily clear the field, so
-              // `/` reopened showing a stale query over an unfiltered list.
-              onTextChanged: {
-                root.peerQuery = text
-                root.peerIndex = 0
-              }
-              Keys.onPressed: function(event) {
-                if (event.key === Qt.Key_Escape) {
-                  root.closeSearch()
-                  event.accepted = true
-                  return
+
+              sourceComponent: TextField {
+                id: peerSearch
+                width: peerSearchLoader.width
+                foreground: root.foreground
+                placeholderText: "Filter peers — name, address, transport, state"
+                // One-way: the field is the source of truth and `peerQuery`
+                // follows it. Binding `text` back to `peerQuery` meant clearing
+                // the property on close did not necessarily clear the field, so
+                // `/` reopened showing a stale query over an unfiltered list.
+                onTextChanged: {
+                  root.peerQuery = text
+                  root.peerIndex = 0
                 }
-                if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Down) {
-                  root.cursorActive = true
-                  root.focusSection = "peers"
-                  keyCatcher.forceActiveFocus()
-                  event.accepted = true
+                Keys.onPressed: function(event) {
+                  if (event.key === Qt.Key_Escape) {
+                    root.closeSearch()
+                    event.accepted = true
+                    return
+                  }
+                  if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Down) {
+                    root.cursorActive = true
+                    root.focusSection = "peers"
+                    keyCatcher.forceActiveFocus()
+                    event.accepted = true
+                  }
                 }
               }
             }

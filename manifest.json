@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "mikebenner.netbird",
   "name": "NetBird",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "Michael Benner",
   "license": "MIT",
   "homepage": "https://github.com/mikebenner/omarchy-netbird",

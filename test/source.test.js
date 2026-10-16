@@ -104,6 +104,19 @@ test("the idle stand-in mirrors every property and function the service exposes"
   }
 })
 
+test("the peer search field exists only while the search is open", () => {
+  // Marketplace review of 1.0.0: a Qt text input, even hidden, keeps the
+  // clipboard's paste state fresh, which on Wayland reads foreign clipboard
+  // contents with no size or time bound. Create it on demand, never at build.
+  const src = read("Panel.qml")
+  const loader = src.indexOf("id: peerSearchLoader")
+  assert.ok(loader > 0, "the search field sits behind a Loader")
+  const block = src.slice(loader, loader + 600)
+  assert.match(block, /active: root\.searchOpen/)
+  assert.match(block, /sourceComponent: TextField \{/)
+  assert.doesNotMatch(src.replace(block, ""), /\n\s*TextField \{\s*\n\s*id: peerSearch\b/, "no second, eagerly built search field")
+})
+
 test("the documented IPC surface is present", () => {
   const src = read("Panel.qml")
   for (const fn of ["open", "close", "show", "hide", "toggle", "refresh", "up", "down", "toggleNetbird", "status"]) {
