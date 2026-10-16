@@ -4,6 +4,7 @@ import QtQuick.Layouts
 import Quickshell
 import Quickshell.Io
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 import "Model.js" as Model
 
@@ -21,6 +22,12 @@ Panel {
   manageIpc: false
 
   property string focusSection: "header"
+  // Items inside the panel's lazily built content, null until it first
+  // opens. Code inside the content reaches its own ids directly.
+  readonly property Item panelFlick: panel.loadedContent ? panel.loadedContent.panelFlick : null
+  readonly property Item peerColumn: panel.loadedContent ? panel.loadedContent.peerColumn : null
+  readonly property Item peerSearch: panel.loadedContent ? panel.loadedContent.peerSearch : null
+  readonly property Item selfRow: panel.loadedContent ? panel.loadedContent.selfRow : null
   property int peerIndex: 0
   property bool cursorActive: false
   property bool copyMenuOpen: false
@@ -35,9 +42,11 @@ Panel {
   // value that changes. Ticks only while a detail is actually on screen.
   property double detailNow: Date.now()
 
-  readonly property color foreground: bar ? bar.foreground : Color.foreground
-  readonly property color urgent: bar ? bar.urgent : Color.urgent
+  readonly property color foreground: bar ? bar.foreground : Commons.Color.foreground
+  readonly property color urgent: bar ? bar.urgent : Commons.Color.urgent
   readonly property color dim: Qt.darker(foreground, 1.55)
+  readonly property color hoverFill: bar ? Style.hoverFillFor(bar.foreground, Commons.Color.accent) : "transparent"
+  readonly property color selectedFill: bar ? Style.selectedFillFor(bar.foreground, Commons.Color.accent) : "transparent"
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property bool showSelf: netbird.installed && netbird.active && (netbird.selfIp !== "" || netbird.selfFqdn !== "")
   readonly property bool showPeers: netbird.active && visiblePeers.length > 0
@@ -47,7 +56,7 @@ Panel {
   // "theme" unless the user asked for the official artwork; an unrecognised
   // value falls back to the themed mark rather than to nothing.
   readonly property string iconStyle: String(setting("iconStyle", "theme") || "") === "color" ? "color" : "theme"
-  readonly property color barBackground: bar && bar.background ? bar.background : Color.background
+  readonly property color barBackground: bar && bar.background ? bar.background : Commons.Color.background
 
   // A toggle the daemon has not caught up with yet. `active` is the optimistic
   // value and `running` the observed one, so they disagree exactly while a
@@ -249,7 +258,7 @@ Panel {
   function activateCursor() {
     ensureCursor()
     if (focusSection === "header") netbird.toggleNetbird()
-    else if (focusSection === "self") selfRow.openCopyMenu()
+    else if (focusSection === "self") { if (selfRow) selfRow.openCopyMenu() }
     else if (focusSection === "profiles") {
       var list = netbird.profiles || []
       var entry = list[Math.max(0, Math.min(profileIndex, list.length - 1))]
@@ -332,7 +341,7 @@ Panel {
     if (peerSearch) peerSearch.text = ""
     peerQuery = ""
     peerIndex = 0
-    if (root.opened) Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+    if (root.opened) Qt.callLater(function() { if (panel.loadedContent) panel.loadedContent.forceActiveFocus() })
   }
 
   function setHeaderCursor() {
@@ -345,7 +354,8 @@ Panel {
 
   onOpenedChanged: {
     // The service lists networks only while someone is looking at them.
-    netbird.panelOpen = opened
+    if (opened) netbird.panelOpened()
+    else netbird.panelClosed()
     if (!opened) {
       // Transient view state does not survive a close. Without this the filter
       // field reappears on the next open, showing over an unfiltered list, and
@@ -375,7 +385,7 @@ Panel {
     // starts them when its own state says they can run, including on the
     // first poll that clears the outage.
     netbird.refresh()
-    Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+    Qt.callLater(function() { if (panel.loadedContent) panel.loadedContent.forceActiveFocus() })
   }
   onPeerIndexChanged: scrollCursorIntoView()
   onShowSelfChanged: ensureCursor()
@@ -386,9 +396,156 @@ Panel {
   onShowProfilesChanged: ensureCursor()
   onShowNetworksChanged: ensureCursor()
 
-  Service {
-    id: netbird
-    settings: root.settings
+  // The daemon state machine is the plugin's service, which the shell loads
+  // once and hands to every monitor's widget: one poll, one toggle gate, one
+  // optimistic state, however many bars there are. Until it arrives, or under
+  // a replacement bar that offers no service lookup, `idle` stands in.
+  property var sharedService: null
+  readonly property var netbird: sharedService || idle
+
+  function findService() {
+    if (sharedService) return
+    if (bar && bar.shell && typeof bar.shell.serviceFor === "function") {
+      var found = bar.shell.serviceFor(moduleName)
+      if (found) sharedService = found
+    }
+  }
+
+  Component.onCompleted: findService()
+  onBarChanged: findService()
+  onSharedServiceChanged: if (sharedService) sharedService.settings = root.settings
+  onSettingsChanged: if (sharedService) sharedService.settings = root.settings
+  Component.onDestruction: if (root.opened && sharedService) sharedService.panelClosed()
+
+  Timer {
+    interval: 1000
+    repeat: true
+    running: root.sharedService === null
+    onTriggered: root.findService()
+  }
+
+  // Stands in for the service until the shell has handed it over, so every
+  // binding below has something to read and nothing to do.
+  QtObject {
+    id: idle
+    property int openPanels: 0
+    property bool panelOpen: false
+    property var settings: ({})
+    property bool installed: false
+    property bool running: false
+    property bool needsLogin: false
+    property int _desired: 0
+    property bool active: false
+    property bool refreshing: false
+    property string daemonStatus: ""
+    property string statusText: ""
+    property string selfName: ""
+    property string selfFqdn: ""
+    property string selfIp: ""
+    property string profileName: ""
+    property string managementHost: ""
+    property string managementUrl: ""
+    property bool managementConnected: false
+    property string signalHost: ""
+    property bool signalConnected: false
+    property int relaysTotal: 0
+    property int relaysAvailable: 0
+    property int peersTotal: 0
+    property int peersConnected: 0
+    property string sessionExpiresAt: ""
+    property string sessionText: ""
+    property string cliVersion: ""
+    property string daemonVersion: ""
+    property bool degraded: false
+    property string degradedText: ""
+    property bool daemonDown: false
+    property string daemonDownReason: ""
+    property string loginCode: ""
+    property var relays: []
+    property string versionNotice: ""
+    property var networks: []
+    property bool networksLoaded: false
+    property bool panelOpen: false
+    property var networkDesired: ({})
+    property int _networkGeneration: 0
+    property int _networkReadGeneration: 0
+    property bool _networksDirty: false
+    property bool _profilesDirty: false
+    property int _networksAttempts: 0
+    property int _profilesAttempts: 0
+    property int _networksBusyRefusals: 0
+    property int _profilesBusyRefusals: 0
+    property int _networksRequestEpoch: 0
+    property int _profilesRequestEpoch: 0
+    property int _networksReadEpoch: 0
+    property int _profilesReadEpoch: 0
+    property bool _profileListShowId: false
+    property var profiles: []
+    property bool profilesLoaded: false
+    property bool loginActive: false
+    property var peers: []
+    property string actionStatus: ""
+    property string lastError: ""
+    property int refreshIntervalSec: 0
+    property int pollTimeoutSec: 0
+    property bool busy: false
+    property bool networksBusy: false
+    property bool mutating: false
+    property bool profilesBusy: false
+    property string adminUrl: ""
+    property int pollIntervalSec: 0
+    property string peerCountText: ""
+    property int _consecutiveDaemonFailures: 0
+    property bool _loginInProgress: false
+    property bool _loginUrlOpened: false
+    property string _loginBuffer: ""
+    property bool _loginCancelled: false
+    property bool _watchdogReaped: false
+    property bool _networkWriteInFlight: false
+    function _correctiveState() { return false }
+    function _drainList() { return false }
+    function _dropAccountLists() { return false }
+    function _noteCorrective() { return false }
+    function _runNetworkAction() { return false }
+    function _setNetworkDesired() { return false }
+    function activeProfile() { return false }
+    function cancelLogin() { return false }
+    function clearDaemonDown() { return false }
+    function copyPeerFqdn() { return false }
+    function copyPeerIp() { return false }
+    function copyPeerName() { return false }
+    function copyToClipboard() { return false }
+    function deselectAllNetworks() { return false }
+    function down() { return false }
+    function enterDaemonDown() { return false }
+    function handleLoginOutput() { return false }
+    function intSetting() { return false }
+    function networkSelected() { return false }
+    function openAdminConsole() { return false }
+    function openAuthUrl() { return false }
+    function openAuthUrlFrom() { return false }
+    function parseStatus() { return false }
+    function pingPeer() { return false }
+    function profileDisplayName() { return false }
+    function refresh() { return false }
+    function refreshNetworks() { return false }
+    function refreshProfiles() { return false }
+    function refreshStatus() { return false }
+    function requestList() { return false }
+    function requestLists() { return false }
+    function resetUnavailable() { return false }
+    function runAction() { return false }
+    function selectAllNetworks() { return false }
+    function selectProfile() { return false }
+    function setting() { return false }
+    function shortName() { return false }
+    function sshToPeer() { return false }
+    function summary() { return false }
+    function toggleNetbird() { return false }
+    function toggleNetwork() { return false }
+    function up() { return false }
+    function panelOpened() {}
+    function panelClosed() {}
   }
 
   Timer {
@@ -408,7 +565,7 @@ Panel {
     function onProfilesChanged() { root.ensureCursor() }
   }
 
-  IpcHandler {
+  ShellIpc {
     target: root.ipcTarget
     function open(): void { root.open() }
     function close(): void { root.close() }
@@ -433,9 +590,10 @@ Panel {
     iconComponent: Component {
       Item {
         NetbirdIcon {
-          anchors.centerIn: parent
-          iconSize: Style.space(11)
-          state: root.iconState
+          x: (parent.width - width) / 2
+          y: (parent.height - height) / 2
+          iconSize: button.iconSize
+          status: root.iconState
           style: root.iconStyle
           color: root.barForeground
           dimColor: Qt.darker(root.barForeground, 1.55)
@@ -457,12 +615,19 @@ Panel {
     owner: root
     bar: root.bar
     open: root.opened
-    focusTarget: keyCatcher
+    focusTarget: panel.loadedContent
     contentWidth: panel.fittedContentWidth(Style.space(380))
-    contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(560))
+    contentHeight: panel.fittedContentHeight(panel.loadedContentHeight, Style.space(560))
 
-    PanelKeyCatcher {
+    // Built on first open, not at startup: a bar widget is instantiated per
+    // monitor, and this card is most of the plugin.
+    content: PanelKeyCatcher {
       id: keyCatcher
+      property alias panelFlick: panelFlick
+      property alias peerColumn: peerColumn
+      property alias peerSearch: peerSearch
+      property alias selfRow: selfRow
+      implicitHeight: column.implicitHeight
       anchors.fill: parent
       // Blocked while a copy menu is up or the filter field has focus, so
       // typed characters land in the field rather than firing shortcuts.
@@ -539,12 +704,12 @@ Panel {
               iconComponent: Component {
                 NetbirdIcon {
                   iconSize: Style.font.display
-                  state: root.iconState
+                  status: root.iconState
                   style: root.iconStyle
                   color: root.foreground
                   dimColor: root.dim
                   urgentColor: root.urgent
-                  outlineColor: Color.popups.background
+                  outlineColor: Commons.Color.popups.background
                 }
               }
 
@@ -577,6 +742,7 @@ Panel {
           }
 
           Text {
+            textFormat: Text.PlainText
             visible: netbird.actionStatus !== "" || netbird.lastError !== ""
             width: parent.width
             text: netbird.actionStatus !== "" ? netbird.actionStatus : netbird.lastError
@@ -633,6 +799,7 @@ Panel {
                 spacing: Style.space(2)
 
                 Text {
+                  textFormat: Text.PlainText
                   Layout.fillWidth: true
                   text: netbird.loginCode !== ""
                     ? "Enter this code to finish signing in"
@@ -645,6 +812,7 @@ Panel {
                 }
 
                 Text {
+                  textFormat: Text.PlainText
                   visible: netbird.loginCode !== ""
                   Layout.fillWidth: true
                   text: netbird.loginCode
@@ -702,6 +870,7 @@ Panel {
           // Both numbers are in the status document already; a mismatch is a
           // real support-ticket source and costs one caption to surface.
           Text {
+            textFormat: Text.PlainText
             visible: netbird.versionNotice !== ""
             width: parent.width
             text: netbird.versionNotice
@@ -729,6 +898,7 @@ Panel {
             Repeater {
               model: netbird.relays
               Text {
+                textFormat: Text.PlainText
                 required property var modelData
                 width: parent.width
                 leftPadding: Style.space(34)
@@ -911,6 +1081,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               visible: netbird.active && netbird.peers.length > 0 && root.visiblePeers.length === 0
               width: parent.width
               text: "No peer matches " + root.peerQuery
@@ -1006,12 +1177,12 @@ Panel {
         menu.clampIndex()
         Qt.callLater(function() { menuContent.forceActiveFocus() })
       } else if (root.opened) {
-        Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+        Qt.callLater(function() { if (panel.loadedContent) panel.loadedContent.forceActiveFocus() })
       }
     }
 
     background: BorderSurface {
-      color: Color.background
+      color: Commons.Color.background
       borderSpec: Border.flat(root.dim, 1)
       radius: Style.cornerRadius
     }
@@ -1069,6 +1240,7 @@ Panel {
       spacing: Style.space(10)
 
       Text {
+        textFormat: Text.PlainText
         Layout.fillWidth: true
         text: copyChoice.label
         color: root.foreground
@@ -1130,6 +1302,7 @@ Panel {
         spacing: Style.space(1)
 
         Text {
+          textFormat: Text.PlainText
           Layout.fillWidth: true
           text: netbird.selfFqdn !== "" ? netbird.selfFqdn : netbird.selfName
           color: root.foreground
@@ -1139,6 +1312,7 @@ Panel {
         }
 
         Text {
+          textFormat: Text.PlainText
           Layout.fillWidth: true
           text: root.selfDetail
           visible: text !== ""
@@ -1187,8 +1361,8 @@ Panel {
     hasCursor: root.cursorActive && root.focusSection === "profiles" && root.profileIndex === rowIndex
     current: isActive
     foreground: root.foreground
-    fill: Style.hoverFillFor(root.foreground, Color.accent)
-    currentFill: Style.selectedFillFor(root.foreground, Color.accent)
+    fill: root.hoverFill
+    currentFill: root.selectedFill
 
     implicitHeight: profileInner.implicitHeight + Style.spacing.xl
 
@@ -1202,6 +1376,7 @@ Panel {
       spacing: Style.space(8)
 
       Text {
+        textFormat: Text.PlainText
         text: profileRow.isActive ? "◉" : "○"
         color: profileRow.isActive ? root.foreground : root.dim
         font.family: root.fontFamily
@@ -1212,6 +1387,7 @@ Panel {
       }
 
       Text {
+        textFormat: Text.PlainText
         text: profileRow.profileName
         color: root.foreground
         font.family: root.fontFamily
@@ -1288,6 +1464,7 @@ Panel {
         spacing: Style.space(1)
 
         Text {
+          textFormat: Text.PlainText
           Layout.fillWidth: true
           text: networkRow.networkId
           color: root.foreground
@@ -1297,6 +1474,7 @@ Panel {
         }
 
         Text {
+          textFormat: Text.PlainText
           Layout.fillWidth: true
           visible: text !== ""
           text: {
@@ -1403,137 +1581,143 @@ Panel {
       anchors.topMargin: Style.spacing.rowPaddingX / 2
       spacing: Style.space(6)
 
-    RowLayout {
-      width: parent.width
-      anchors.leftMargin: Style.space(10)
-      anchors.rightMargin: Style.space(8)
-      spacing: Style.space(8)
-
-      Text {
-        text: peerRow.peer ? String(peerRow.peer.glyph || "○") : "○"
-        color: peerRow.peerDimmed ? root.dim : root.foreground
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.icon
-        Layout.alignment: Qt.AlignVCenter
-      }
-
-      ColumnLayout {
-        id: peerContent
-        Layout.fillWidth: true
-        spacing: Style.space(1)
+      RowLayout {
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.leftMargin: Style.space(10)
+        anchors.rightMargin: Style.space(8)
+        spacing: Style.space(8)
 
         Text {
-          Layout.fillWidth: true
-          text: peerRow.peerName
+          textFormat: Text.PlainText
+          text: peerRow.peer ? String(peerRow.peer.glyph || "○") : "○"
           color: peerRow.peerDimmed ? root.dim : root.foreground
           font.family: root.fontFamily
-          font.pixelSize: Style.font.body
-          elide: Text.ElideRight
+          font.pixelSize: Style.font.icon
+          Layout.alignment: Qt.AlignVCenter
         }
 
-        Text {
+        ColumnLayout {
+          id: peerContent
           Layout.fillWidth: true
-          text: peerRow.peerDetail
-          visible: text !== ""
-          color: root.dim
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.caption
-          elide: Text.ElideRight
-        }
-      }
-
-      PanelActionButton {
-        visible: peerRow.peer && peerRow.peer.online === true && peerRow.peerAddressable
-        iconText: "󰆍"
-        tooltipText: "SSH to this peer (s)"
-        foreground: root.foreground
-        fontFamily: root.fontFamily
-        Layout.alignment: Qt.AlignVCenter
-        onClicked: netbird.sshToPeer(peerRow.peer)
-      }
-
-      PanelActionButton {
-        visible: peerRow.peer && peerRow.peer.online === true && peerRow.peerAddressable
-        // A plain Unicode arrow pair, not a Nerd Font codepoint: the icon this
-        // slot first used has no glyph in the bar font and fell back to a
-        // letter box. Verified rendering in JetBrainsMono Nerd Font.
-        iconText: "⇄"
-        tooltipText: "Ping this peer (p)"
-        foreground: root.foreground
-        fontFamily: root.fontFamily
-        Layout.alignment: Qt.AlignVCenter
-        onClicked: netbird.pingPeer(peerRow.peer)
-      }
-
-      PanelActionButton {
-        iconText: peerRow.expanded ? "󰅃" : "󰅀"
-        tooltipText: peerRow.expanded ? "Hide details" : "Show details"
-        foreground: root.foreground
-        fontFamily: root.fontFamily
-        Layout.alignment: Qt.AlignVCenter
-        onClicked: root.togglePeerDetail(peerRow.peer)
-      }
-
-      PanelActionButton {
-        id: peerCopyButton
-        iconText: "󰆏"
-        tooltipText: "Copy peer details"
-        foreground: root.foreground
-        fontFamily: root.fontFamily
-        enabled: peerRow.copyOptions.length > 0
-        Layout.alignment: Qt.AlignVCenter
-        onClicked: peerRow.openCopyMenu()
-      }
-
-      CopyMenu {
-        id: peerCopyMenu
-        options: peerRow.copyOptions
-        anchorButton: peerCopyButton
-        onChosen: function(kind) {
-          if (kind === "name") netbird.copyPeerName(peerRow.peer)
-          else if (kind === "fqdn") netbird.copyPeerFqdn(peerRow.peer)
-          else if (kind === "ip") netbird.copyPeerIp(peerRow.peer)
-          else if (kind === "key") netbird.copyToClipboard(peerRow.peerKey)
-        }
-      }
-    }
-
-    // The fields the status document already carries and we used to discard —
-    // the answer to "why is this peer relayed?", which is what the panel is
-    // for. Collapsed until asked for, one peer at a time.
-    Column {
-      id: peerDetail
-      visible: peerRow.expanded
-      width: parent.width
-      spacing: Style.space(2)
-
-      Repeater {
-        model: peerRow.detailRows
-        RowLayout {
-          required property var modelData
-          width: peerDetail.width
-          spacing: Style.space(8)
+          spacing: Style.space(1)
 
           Text {
-            Layout.preferredWidth: Style.space(96)
-            leftPadding: Style.space(34)
-            text: modelData.label
-            color: root.dim
+            textFormat: Text.PlainText
+            Layout.fillWidth: true
+            text: peerRow.peerName
+            color: peerRow.peerDimmed ? root.dim : root.foreground
             font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
+            font.pixelSize: Style.font.body
+            elide: Text.ElideRight
           }
 
           Text {
+            textFormat: Text.PlainText
             Layout.fillWidth: true
-            text: modelData.value
-            color: root.foreground
+            text: peerRow.peerDetail
+            visible: text !== ""
+            color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
             elide: Text.ElideRight
           }
         }
+
+        PanelActionButton {
+          visible: peerRow.peer && peerRow.peer.online === true && peerRow.peerAddressable
+          iconText: "󰆍"
+          tooltipText: "SSH to this peer (s)"
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          Layout.alignment: Qt.AlignVCenter
+          onClicked: netbird.sshToPeer(peerRow.peer)
+        }
+
+        PanelActionButton {
+          visible: peerRow.peer && peerRow.peer.online === true && peerRow.peerAddressable
+          // A plain Unicode arrow pair, not a Nerd Font codepoint: the icon this
+          // slot first used has no glyph in the bar font and fell back to a
+          // letter box. Verified rendering in JetBrainsMono Nerd Font.
+          iconText: "⇄"
+          tooltipText: "Ping this peer (p)"
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          Layout.alignment: Qt.AlignVCenter
+          onClicked: netbird.pingPeer(peerRow.peer)
+        }
+
+        PanelActionButton {
+          iconText: peerRow.expanded ? "󰅃" : "󰅀"
+          tooltipText: peerRow.expanded ? "Hide details" : "Show details"
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          Layout.alignment: Qt.AlignVCenter
+          onClicked: root.togglePeerDetail(peerRow.peer)
+        }
+
+        PanelActionButton {
+          id: peerCopyButton
+          iconText: "󰆏"
+          tooltipText: "Copy peer details"
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          enabled: peerRow.copyOptions.length > 0
+          Layout.alignment: Qt.AlignVCenter
+          onClicked: peerRow.openCopyMenu()
+        }
+
+        CopyMenu {
+          id: peerCopyMenu
+          options: peerRow.copyOptions
+          anchorButton: peerCopyButton
+          onChosen: function(kind) {
+            if (kind === "name") netbird.copyPeerName(peerRow.peer)
+            else if (kind === "fqdn") netbird.copyPeerFqdn(peerRow.peer)
+            else if (kind === "ip") netbird.copyPeerIp(peerRow.peer)
+            else if (kind === "key") netbird.copyToClipboard(peerRow.peerKey)
+          }
+        }
       }
-    }
+
+      // The fields the status document already carries and we used to discard —
+      // the answer to "why is this peer relayed?", which is what the panel is
+      // for. Collapsed until asked for, one peer at a time.
+      Column {
+        id: peerDetail
+        visible: peerRow.expanded
+        width: parent.width
+        spacing: Style.space(2)
+
+        Repeater {
+          model: peerRow.detailRows
+          RowLayout {
+            required property var modelData
+            width: peerDetail.width
+            spacing: Style.space(8)
+
+            Text {
+              textFormat: Text.PlainText
+              Layout.preferredWidth: Style.space(96)
+              leftPadding: Style.space(34)
+              text: modelData.label
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            Text {
+              textFormat: Text.PlainText
+              Layout.fillWidth: true
+              text: modelData.value
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              elide: Text.ElideRight
+            }
+          }
+        }
+      }
     }
   }
 }

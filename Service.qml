@@ -10,6 +10,12 @@ import "Model.js" as Model
 Item {
   id: root
 
+  // Injected by the shell for a `service` entry point; unused, declared so
+  // the host has somewhere to put them.
+  property var shell: null
+  property var manifest: null
+
+  // Pushed by the widget: a service is not handed bar settings.
   property var settings: ({})
 
   property bool installed: false
@@ -56,7 +62,13 @@ Item {
   // and nobody is looking at it otherwise.
   property var networks: []
   property bool networksLoaded: false
-  property bool panelOpen: false
+  // Several panels share this service, one per monitor; the lists are owed
+  // while any of them is open.
+  property int openPanels: 0
+  readonly property bool panelOpen: openPanels > 0
+
+  function panelOpened() { openPanels += 1 }
+  function panelClosed() { openPanels = Math.max(0, openPanels - 1) }
   // Rows the user has just flipped, before the daemon has confirmed. Keyed by
   // network id, same optimistic contract as the tunnel toggle, same deadline.
   property var networkDesired: ({})

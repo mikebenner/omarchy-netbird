@@ -2,6 +2,7 @@ import Quickshell
 import QtQuick
 import QtQuick.Shapes
 import qs.Commons
+import qs.Commons as Commons
 
 // The NetBird mark, in one of two styles:
 //
@@ -23,38 +24,35 @@ import qs.Commons
 // any bar size, and it needs no render effect, which is what the "color" style
 // would otherwise require to follow a theme.
 //
-// `state` is Item's own string property rather than a redeclared one: QML will
-// not let a subclass shadow it, and with no `states:` defined the state machine
-// stays inert, so it behaves as the plain string the API asks for.
 Item {
   id: root
 
   property real iconSize: Style.font.icon
-  property color color: Color.foreground
+  property color color: Commons.Color.foreground
   property color dimColor: Qt.darker(color, 1.55)
-  property color urgentColor: Color.urgent
+  property color urgentColor: Commons.Color.urgent
   // What the badges are cut out of. Bind to whatever sits behind the icon.
-  property color outlineColor: Color.background
+  property color outlineColor: Commons.Color.background
   property string style: "theme"
 
-  state: "disconnected"
+  property string status: "disconnected"
 
   width: iconSize
   height: iconSize
   implicitWidth: iconSize
   implicitHeight: iconSize
 
-  readonly property bool notInstalled: root.state === "notInstalled"
+  readonly property bool notInstalled: root.status === "notInstalled"
   readonly property bool useColorIcons: root.style === "color"
-  readonly property bool needsAttention: root.state === "error" || root.state === "needsLogin"
-  readonly property bool subdued: notInstalled || root.state === "connecting" || root.state === "disconnected"
+  readonly property bool needsAttention: root.status === "error" || root.status === "needsLogin"
+  readonly property bool subdued: notInstalled || root.status === "connecting" || root.status === "disconnected"
 
   readonly property color markColor: needsAttention
     ? urgentColor
     : (subdued ? dimColor : color)
 
   readonly property string assetState: {
-    var value = String(root.state || "")
+    var value = String(root.status || "")
     if (value === "connected" || value === "connecting" || value === "error") return value
     if (value === "needsLogin") return "needs-login"
     return "disconnected"
@@ -110,7 +108,7 @@ Item {
   }
 
   Shape {
-    visible: !root.useColorIcons && root.state === "connected"
+    visible: !root.useColorIcons && root.status === "connected"
     anchors.fill: parent
     preferredRendererType: Shape.CurveRenderer
     transform: Scale { xScale: root.unit; yScale: root.unit }
@@ -158,7 +156,7 @@ Item {
   }
 
   Row {
-    visible: !root.useColorIcons && root.state === "connecting"
+    visible: !root.useColorIcons && root.status === "connecting"
     anchors.horizontalCenter: parent.horizontalCenter
     anchors.bottom: parent.bottom
     spacing: Math.max(1, Math.round(root.unit * 2.0))

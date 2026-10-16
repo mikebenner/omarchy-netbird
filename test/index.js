@@ -3,3 +3,4 @@
 // suite keeps that form working alongside `node --test test/model.test.js`.
 require("./model.test.js")
 require("./manifest.test.js")
+require("./source.test.js")
