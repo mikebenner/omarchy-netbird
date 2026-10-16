@@ -396,6 +396,7 @@ Mullvad regions, Taildrop file sending, and the operator authorization row.
 
 ```bash
 node --test test/
+bash test/smoke.sh   # loads Service.qml and Panel.qml in a throwaway quickshell against the installed kit
 ```
 
 Fixtures under `test/fixtures/` are synthetic `netbird status --json`
