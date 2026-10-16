@@ -2,20 +2,22 @@
   "schemaVersion": 1,
   "id": "mikebenner.netbird",
   "name": "NetBird",
-  "version": "0.1.1",
+  "version": "1.0.0",
   "author": "Michael Benner",
   "license": "MIT",
   "homepage": "https://github.com/mikebenner/omarchy-netbird",
-  "description": "NetBird status, peer browsing, and quick copy actions in the Omarchy bar.",
+  "description": "NetBird in the Omarchy bar: a live tunnel switch, every peer with its transport, latency and routes, network routes you can flip, SSO login when the daemon asks, and copy, SSH and ping a keystroke away.",
   "kinds": [
+    "service",
     "bar-widget"
   ],
   "entryPoints": {
+    "service": "Service.qml",
     "barWidget": "Panel.qml"
   },
   "barWidget": {
     "displayName": "NetBird",
-    "description": "Toggle NetBird, browse peers, and copy peer IPs or names.",
+    "description": "Tunnel switch, peers, network routes and profiles for NetBird. Left click opens the panel, right click toggles the tunnel, middle click refreshes.",
     "category": "Network",
     "allowMultiple": false,
     "defaultSection": "right",
@@ -53,5 +55,6 @@
         "description": "Overrides the derived admin console link. Left empty the URL comes from the management URL, and NetBird Cloud maps to https://app.netbird.io automatically — set this only for a split dashboard host of your own."
       }
     ]
-  }
+  },
+  "keepLoaded": true
 }

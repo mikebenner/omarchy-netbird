@@ -1,11 +1,12 @@
-# NetBird Omarchy Widget
+# NetBird for Omarchy
 
-Omarchy bar widget for [NetBird](https://netbird.io), modeled on the
-first-party `omarchy.tailscale` widget: the same bar icon, the same
-keyboard-driven popup, the same power switch in the hero, and the same copy
-menus. Everything it knows comes from the `netbird` CLI.
+[NetBird](https://netbird.io) in the Omarchy bar, built the way the first-party Tailscale widget is built: a bar glyph that tells the daemon's state at a glance, a keyboard-driven panel with the tunnel switch in the hero, every peer with its transport, latency and routes, the network routes you can flip, profiles, SSO login when the daemon asks, and copy, SSH and ping a keystroke away. Everything it shows comes from the `netbird` CLI, as your own user: no `sudo`, no `pkexec`, no daemon handshake.
 
-![NetBird bar widget](preview.png)
+![NetBird panel in the Omarchy bar](preview.png)
+
+The bar glyph alone tells you what the tunnel is doing: connected, degraded (management or signal down), signed out, and off.
+
+![Bar glyph states: connected, degraded, needs login, disconnected](docs/screenshots/bar-states.png)
 
 ## Features
 
@@ -44,7 +45,7 @@ menus. Everything it knows comes from the `netbird` CLI.
 
 | Needs | Why | Arch package |
 |---|---|---|
-| Omarchy with the quickshell shell | Hosts the plugin; provides `omarchy plugin`, `omarchy bar` and `omarchy-launch-browser` | `omarchy` (developed against 4.0.1) |
+| Omarchy with the quickshell shell | Hosts the plugin; provides `omarchy plugin`, `omarchy bar` and `omarchy-launch-browser` | `omarchy` on the `quattro` channel from 2026-10-12 or later (the panel card is built lazily through `KeyboardPanel.content`, which arrived then); 1.0.0 was developed against the 2026-10-15 tip |
 | `netbird` CLI **and** a running daemon | Every piece of state comes from `netbird status --json`; the toggle runs `netbird up` / `netbird down` | `netbird-bin` (developed against 0.77.0 and 0.77.1) |
 | `wl-copy` | The copy actions on the device and peer rows | `wl-clipboard` |
 | `omarchy-launch-browser` | Opens the SSO URL when the daemon needs to re-authenticate | ships with `omarchy` |
@@ -118,7 +119,7 @@ omarchy-shell mikebenner.netbird status    # one-line summary of the mesh
 ```
 
 `up` and `down` answer `ok`, or `busy` when the other one is still running —
-the widget runs at most one of them at a time. `status` answers with the daemon
+the plugin's service runs at most one of them at a time, whichever monitor's bar or IPC call asked. `status` answers with the daemon
 state, this device's name and address, the peer count, and the session clock:
 
 ```
